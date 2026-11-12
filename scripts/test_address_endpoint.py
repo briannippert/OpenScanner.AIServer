@@ -3,11 +3,29 @@
 import http.server, threading, subprocess, os, time, urllib.request, urllib.error, json
 import socket
 import tempfile
+from urllib.parse import urlparse, parse_qs
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 fields = ['address','houseNumber','street','unit','city','state','postalCode','country','crossStreet']
+geocode_calls = []
 class Backend(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        query = parse_qs(urlparse(self.path).query)
+        assert urlparse(self.path).path == '/geocoder'
+        assert query['benchmark'] == ['Public_AR_Current'] and query['format'] == ['json']
+        address = query['address'][0]
+        geocode_calls.append((address, time.monotonic()))
+        if address == 'unavailable': self.send_error(503); return
+        if address == 'timeout': time.sleep(3); return
+        matches = [] if address == 'missing' else [
+            {'matchedAddress': '123 MAIN ST, NORTH CITY, VA', 'coordinates': {'x': -77.1, 'y': 38.9}}]
+        if address == 'ambiguous':
+            matches.append({'matchedAddress': '123 MAIN ST, SOUTH CITY, VA', 'coordinates': {'x': -77.2, 'y': 38.8}})
+        if address == 'invalid': del matches[0]['coordinates']['x']
+        if address == 'out-of-range': matches[0]['coordinates']['y'] = 100
+        self.send_response(200); self.send_header('Content-Type', 'application/json'); self.end_headers()
+        self.wfile.write(json.dumps({'result': {'addressMatches': matches}}).encode())
     def log_message(self, *args): pass
     def do_POST(self):
         if self.headers.get('Transfer-Encoding') == 'chunked':
@@ -20,8 +38,19 @@ class Backend(http.server.BaseHTTPRequestHandler):
         else: raw=self.rfile.read(int(self.headers['Content-Length']))
         data=json.loads(raw)
         assert self.path == '/api/chat' and data['think'] is False and data['stream'] is False
-        assert data['options']['num_ctx']==4096 and data['format']['required']==fields
+        assert data['options']['num_ctx']==4096
+        ranking = data['format']['required'] == ['selectedMatchIndex']
+        if not ranking: assert data['format']['required']==fields
         text=data['messages'][-1]['content']
+        if ranking:
+            selection = json.loads(text)
+            context = selection['context']
+            if context == 'offline': self.send_error(503); return
+            if context == 'slow': time.sleep(3); return
+            selected = 1 if context == 'South City' else (99 if context == 'bad-index' else None)
+            self.send_response(200); self.send_header('Content-Type', 'application/json'); self.end_headers()
+            self.wfile.write(json.dumps({'done': True, 'message': {'content': json.dumps({'selectedMatchIndex': selected})}}).encode())
+            return
         if text=='unavailable': self.send_error(503); return
         if text=='timeout': time.sleep(2); return
         result=dict.fromkeys(fields)
@@ -39,6 +68,7 @@ with socket.socket() as probe:
 base_url = f'http://127.0.0.1:{app_port}'
 env=dict(os.environ, Address__OllamaUrl=f'http://127.0.0.1:{backend.server_port}',
          ASPNETCORE_ENVIRONMENT='Production', DOTNET_ENVIRONMENT='Production',
+         Geocoding__Endpoint=f'http://127.0.0.1:{backend.server_port}/geocoder', Geocoding__TimeoutSeconds='2',
          Address__TimeoutSeconds='1', Whisper__WhisperServerBinary='/nonexistent/test-whisper')
 with tempfile.TemporaryFile(mode='w+') as log:
     app=subprocess.Popen(['dotnet','bin/Debug/net10.0/OpenScanner.WhisperServer.dll','--urls',base_url],cwd=ROOT,env=env,stdout=log,stderr=log)
@@ -53,7 +83,7 @@ with tempfile.TemporaryFile(mode='w+') as log:
             assert 'Swagger UI' in response.read().decode()
         with urllib.request.urlopen(base_url + '/swagger/v1/swagger.json') as response:
             spec = json.load(response)
-        assert set(spec['paths']) == {'/health', '/models', '/transcribe', '/address'}
+        assert set(spec['paths']) == {'/health', '/models', '/transcribe', '/address', '/geocode'}
         upload = spec['paths']['/transcribe']['post']['requestBody']['content']['multipart/form-data']['schema']
         assert upload['required'] == ['file']
         assert upload['properties']['file']['format'] == 'binary'
@@ -67,8 +97,8 @@ with tempfile.TemporaryFile(mode='w+') as log:
             operation = next(iter(spec['paths'][path].values()))
             assert operation['responses']['200']['content']['application/json']['schema']
         print('PASS: Swagger UI and OpenAPI routes, upload fields, and response schemas in Production')
-        def request(payload):
-            req=urllib.request.Request(base_url + '/address',data=json.dumps(payload).encode(),headers={'Content-Type':'application/json'})
+        def request(payload, route="/address"):
+            req=urllib.request.Request(base_url + route,data=json.dumps(payload).encode(),headers={'Content-Type':'application/json'})
             try:
                 with urllib.request.urlopen(req) as r: return r.status,json.load(r)
             except urllib.error.HTTPError as e: return e.code,json.load(e)
@@ -77,5 +107,30 @@ with tempfile.TemporaryFile(mode='w+') as log:
         assert request({'text':'nothing here'})==(200,dict.fromkeys(fields))
         for text,status in [('invalid',502),('truncated',502),('unavailable',503),('timeout',504)]:
             assert request({'text':text})[0]==status, text
+        def geocode(address, context=None):
+            return request({'address': address, 'context': context}, '/geocode')
+        for address in [None, '', ' ', 'x'*501]: assert geocode(address)[0] == 400
+        assert geocode('123 Main St', 'x'*2001)[0] == 400
+        status, result = geocode('123 Main St & test')
+        assert status == 200 and result['selectedMatch']['latitude'] == 38.9
+        assert result['selectedMatch']['longitude'] == -77.1 and result['selectionStatus'] == 'single_match'
+        count = len(geocode_calls)
+        assert geocode(' 123 MAIN ST & TEST ')[1] == result and len(geocode_calls) == count
+        status, result = geocode('missing')
+        assert status == 200 and not result['found'] and result['matches'] == [] and result['selectedMatch'] is None
+        count = len(geocode_calls)
+        assert geocode('missing')[0] == 200 and len(geocode_calls) == count
+        for text, status in [('invalid', 502), ('out-of-range', 502), ('unavailable', 503), ('timeout', 504)]:
+            assert geocode(text)[0] == status, text
+        # Same cached candidates, different contexts: selections must not leak between requests.
+        status, result = geocode('ambiguous', 'South City')
+        assert status == 200 and len(result['matches']) == 2 and result['selectedMatchIndex'] == 1
+        assert result['selectedMatch']['longitude'] == -77.2 and result['selectionStatus'] == 'llm_selected'
+        for context, expected in [(None, 'ambiguous'), ('bad-index', 'llm_unavailable'), ('offline', 'llm_unavailable'), ('slow', 'llm_unavailable')]:
+            status, result = geocode('ambiguous', context)
+            assert status == 200 and result['selectedMatch'] is None and result['selectionStatus'] == expected
+            assert len(result['matches']) == 2
+        assert all(b[1] - a[1] >= .95 for a, b in zip(geocode_calls, geocode_calls[1:]))
+        print('PASS: geocoding validation, encoding, coordinates, caching, throttling, failures, and LLM selection/fallback')
         print('PASS: 10 endpoint checks (validation, extraction, no address, invalid/truncated JSON, backend failure, timeout)')
     finally: app.terminate(); app.wait(timeout=10); backend.shutdown(); backend.server_close()

@@ -19,6 +19,12 @@ builder.Services.AddSwaggerGen(options =>
 builder.Services.AddHttpClient();
 builder.Services.AddHttpClient("address", client => client.Timeout = Timeout.InfiniteTimeSpan);
 builder.Services.AddSingleton<AddressExtractor>();
+builder.Services.AddHttpClient("geocoding", client =>
+{
+    client.Timeout = Timeout.InfiniteTimeSpan;
+    client.DefaultRequestHeaders.UserAgent.ParseAdd("OpenScanner.WhisperServer/1.0");
+}).RemoveAllLoggers();
+builder.Services.AddSingleton<AddressGeocoder>();
 // Non-logging client for internal loopback calls to whisper-server: the health
 // poll during model startup would otherwise flood the log with expected
 // connection-refused messages while the child boots.
@@ -158,6 +164,53 @@ app.MapPost("/address", async (AddressRequest request, AddressExtractor extracto
 .WithSummary("Extract the first address or intersection from text")
 .WithDescription("Send nonblank text of at most 2,000 characters. Missing address fields are null; if no address is found, all fields are null.")
 .Produces<AddressResponse>()
+.Produces<ApiError>(400).Produces<ApiError>(502).Produces<ApiError>(503).Produces<ApiError>(504);
+
+app.MapPost("/geocode", async (GeocodeRequest request, AddressGeocoder geocoder,
+    AddressExtractor extractor, HttpContext context) =>
+{
+    if (string.IsNullOrWhiteSpace(request.Address) || request.Address.Length > 500)
+        return Results.BadRequest(new ApiError("Address is required and must be at most 500 characters."));
+    if (request.Context?.Length > 2000)
+        return Results.BadRequest(new ApiError("Context must be at most 2,000 characters."));
+    try
+    {
+        var result = await geocoder.GeocodeAsync(request.Address, context.RequestAborted);
+        if (result.Matches.Count > 1)
+        {
+            try
+            {
+                var selected = await extractor.SelectMatchAsync(request.Address, request.Context,
+                    result.Matches, context.RequestAborted);
+                result = result with { SelectedMatchIndex = selected,
+                    SelectionStatus = selected.HasValue ? "llm_selected" : "ambiguous" };
+            }
+            catch (Exception ex) when (ex is HttpRequestException or System.Text.Json.JsonException ||
+                (ex is OperationCanceledException && !context.RequestAborted.IsCancellationRequested))
+            {
+                // Geocoding succeeded; retain candidates even if local ranking failed.
+                result = result with { SelectionStatus = "llm_unavailable" };
+            }
+        }
+        return Results.Ok(result);
+    }
+    catch (OperationCanceledException) when (!context.RequestAborted.IsCancellationRequested)
+    {
+        return Results.Json(new ApiError("Geocoding timed out."), statusCode: 504);
+    }
+    catch (HttpRequestException)
+    {
+        return Results.Json(new ApiError("Geocoding provider unavailable. Try again later."), statusCode: 503);
+    }
+    catch (System.Text.Json.JsonException)
+    {
+        return Results.Json(new ApiError("Geocoding provider returned invalid data."), statusCode: 502);
+    }
+})
+.WithName("GeocodeAddress").WithTags("Address")
+.WithSummary("Find map coordinates for a US street address")
+.WithDescription("Sends the address to the US Census geocoder. Include a house number, street, and city/state or ZIP. Returns all candidate matches and uses the local LLM to select among multiple matches using optional context (up to 2,000 characters). Selection may remain null. Coordinates are estimates, not verified building locations. Intersections are not supported by this provider.")
+.Produces<GeocodeResponse>()
 .Produces<ApiError>(400).Produces<ApiError>(502).Produces<ApiError>(503).Produces<ApiError>(504);
 
 app.Run();

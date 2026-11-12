@@ -114,7 +114,7 @@ To run manually: `dotnet run --urls "http://0.0.0.0:8090"` (default dev port is 
 ## Swagger / API documentation
 
 Open `/swagger` on the running server (for example,
-`http://localhost:8090/swagger`) to explore and try all four endpoints, including
+`http://localhost:8090/swagger`) to explore and try all five endpoints, including
 WAV file uploads and JSON address requests. The OpenAPI document is available at
 `/swagger/v1/swagger.json`. Both are enabled in development and production, so
 Swagger is available when running the installed systemd service.
@@ -265,5 +265,84 @@ not install or update drivers.
 
 Run `dotnet build` and `python3 scripts/test_address_endpoint.py`. The endpoint
 checks use a local mock Ollama service and require Python 3 and loopback sockets;
-they do not download a model or require a GPU. To install this feature branch on
+they do not download a model or require a GPU. They also verify Swagger, Census
+geocoding, caching, throttling, and LLM candidate selection using mock responses. To install this feature branch on
 the server without pulling main, use `./scripts/install_service.sh --skip-update`.
+
+
+## US address coordinates
+
+`POST /geocode` uses the free [US Census geocoder](https://geocoding.geo.census.gov/geocoder/Geocoding_Services_API.html)
+with no API key or GPU required. It sends only the supplied address to the external
+provider. `/address` remains local: pass its extracted `address` to `/geocode`
+when coordinates are needed, including known city/state or ZIP for disambiguation.
+
+```bash
+curl http://localhost:8090/geocode \
+  -H 'Content-Type: application/json' \
+  -d '{"address":"4600 Silver Hill Rd, Washington, DC 20233"}'
+```
+
+Response shape (illustrative coordinates):
+
+```json
+{
+  "found": true,
+  "matches": [
+    {
+      "matchedAddress": "4600 SILVER HILL RD, WASHINGTON, DC, 20233",
+      "latitude": 38.85,
+      "longitude": -76.94
+    }
+  ],
+  "provider": "US Census Bureau",
+  "selectedMatchIndex": 0,
+  "selectionStatus": "single_match",
+  "selectedMatch": {
+    "matchedAddress": "4600 SILVER HILL RD, WASHINGTON, DC, 20233",
+    "latitude": 38.85,
+    "longitude": -76.94
+  }
+}
+```
+
+No match returns HTTP 200 with `found: false`, `matches: []`, and `selectedMatch: null`.
+A single candidate is selected directly. With multiple candidates, the local LLM
+compares the address and optional `context` against the candidate addresses. All
+candidates remain in `matches`; `selectedMatchIndex` is zero-based and
+`selectedMatch` contains the selected provider result, never LLM-generated coordinates.
+
+```json
+{
+  "address": "123 Main St, VA",
+  "context": "Dispatch is responding in South City."
+}
+```
+
+Selection statuses are `no_match`, `single_match`, `llm_selected`, `ambiguous`
+(insufficient evidence), or `llm_unavailable` (model failure, timeout, or invalid
+output). In the latter two cases the selected index and match are null. A selection
+is a model suggestion, not a verified location. Candidate lists over 20 entries or
+selection prompts over 6,000 characters remain ambiguous to avoid truncation.
+The original transcript can be supplied as context; context stays with the local
+Ollama service and is not sent to Census. Ranking uses the same model and inference
+queue as `/address`, with the configured address-model timeout. It does not load
+a second LLM. Cached geocoding candidates are ranked afresh for each context.
+
+ Census estimates points along street
+address ranges; these are not guaranteed rooftop positions. Numbered street
+addresses are required by the provider; bare intersections, landmarks, and incomplete
+transcripts may not resolve. This endpoint does not supply map tiles.
+
+The address must be nonblank and at most 500 characters; optional context is limited
+to 2,000 characters (400 otherwise). Geocoding provider failures
+return 503, malformed results return 502, and geocoding timeouts return 504. Ranking failures return the successful geocoding
+response with `llm_unavailable`. Calls to Census are
+serialized and spaced by at least one second per server process. Up to 1,000 query
+results (including no matches) are cached in memory for 24 hours; restart clears
+the cache. Errors are not cached or automatically retried.
+
+`Geocoding:Endpoint`, `Geocoding:Benchmark` and `Geocoding:TimeoutSeconds` configure
+the Census-compatible backend, dataset (default `Public_AR_Current`), and total
+queue/request timeout (default 30 seconds). Environment overrides use double
+underscores, for example `Geocoding__TimeoutSeconds=60`.
