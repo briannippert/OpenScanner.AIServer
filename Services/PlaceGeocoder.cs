@@ -45,11 +45,20 @@ public sealed class PlaceGeocoder(IHttpClientFactory clients, IConfiguration con
                 matches.Count == 1 ? 0 : null, matches.Count switch { 0 => "no_match", 1 => "single_match", _ => "ambiguous" });
         }
 
+        return await SearchPhotonAsync(name, city, state, null, null, ct);
+    }
+
+    public Task<GeocodeResponse> SearchAddressAsync(string house, string street, string city, string state, CancellationToken ct) =>
+        SearchPhotonAsync($"{house} {street}", city, state, house, street, ct);
+
+    private async Task<GeocodeResponse> SearchPhotonAsync(string name, string city, string state,
+        string? expectedHouse, string? expectedStreet, CancellationToken ct)
+    {
         using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
         deadline.CancelAfter(TimeSpan.FromSeconds(Math.Clamp(config.GetValue("Geocoding:TimeoutSeconds", 30), 1, 300)));
         ct = deadline.Token;
         var query = $"{name}, {city}, {state}, USA";
-        var key = query.ToUpperInvariant();
+        var key = (expectedHouse is null ? "place:" : "address:") + query.ToUpperInvariant();
         await gate.WaitAsync(ct);
         try
         {
@@ -79,24 +88,35 @@ public sealed class PlaceGeocoder(IHttpClientFactory clients, IConfiguration con
                 var placeState = Text(p, "state");
                 // Never silently select another Salem, or another town's branch of a chain.
                 if (!Same(Text(p, "countrycode"), "US") || !Same(city, placeCity) ||
-                    !SameState(state, placeState) || string.IsNullOrWhiteSpace(placeName)) continue;
+                    !SameState(state, placeState)) continue;
+                var house = Text(p, "housenumber");
+                var street = Text(p, "street");
+                if (expectedHouse is null)
+                {
+                    if (string.IsNullOrWhiteSpace(placeName)) continue;
+                }
+                else if (!Same(house, expectedHouse) || street is null || expectedStreet is null ||
+                    !StreetGeocoder.SameStreet(street, expectedStreet) || Text(p, "type") != "house") continue;
                 if (Text(geometry, "type") != "Point" || !geometry.TryGetProperty("coordinates", out var xy) ||
                     xy.ValueKind != JsonValueKind.Array || xy.GetArrayLength() != 2 ||
                     xy[0].ValueKind != JsonValueKind.Number || !xy[0].TryGetDouble(out var lon) ||
                     xy[1].ValueKind != JsonValueKind.Number || !xy[1].TryGetDouble(out var lat) ||
                     !double.IsFinite(lon) || !double.IsFinite(lat) || lon is < -180 or > 180 || lat is < -90 or > 90)
                     throw new JsonException("Invalid place coordinates.");
-                var house = Text(p, "housenumber");
-                var street = Text(p, "street");
                 var zip = Text(p, "postcode");
                 var address = string.Join(", ", new[] { string.Join(" ", new[] { house, street }.Where(v => !string.IsNullOrWhiteSpace(v))),
                     placeCity, placeState, zip }.Where(v => !string.IsNullOrWhiteSpace(v)));
                 matches.Add(new GeocodeMatch(address, lat, lon, placeName, house, street, placeCity,
-                    placeState, zip, "US", "© OpenStreetMap contributors — https://www.openstreetmap.org/copyright"));
+                    placeState, zip, "US", "© OpenStreetMap contributors — https://www.openstreetmap.org/copyright",
+                    Precision: expectedHouse is null ? "place" : Text(p, "osm_key") == "building" ? "building" : "address",
+                    Provider: "Photon / OpenStreetMap"));
             }
-            // Even a single fuzzy search result needs name/context validation by the LLM.
+            // Business names need LLM validation. A full numbered address may be selected
+            // directly only when all requested address components matched uniquely.
+            matches = matches.DistinctBy(m => (m.MatchedAddress.ToUpperInvariant(), m.Latitude, m.Longitude)).ToList();
             var result = new GeocodeResponse(matches.Count > 0, matches, "Photon / OpenStreetMap",
-                SelectionStatus: matches.Count == 0 ? "no_match" : "ambiguous");
+                SelectedMatchIndex: expectedHouse is not null && matches.Count == 1 ? 0 : null,
+                SelectionStatus: matches.Count == 0 ? "no_match" : expectedHouse is not null && matches.Count == 1 ? "verified_building" : "ambiguous");
             cache.Set(key, result, new MemoryCacheEntryOptions { Size = 1, AbsoluteExpirationRelativeToNow = TimeSpan.FromHours(24) });
             return result;
         }
@@ -108,6 +128,6 @@ public sealed class PlaceGeocoder(IHttpClientFactory clients, IConfiguration con
     private static bool Same(string? left, string? right) =>
         string.Equals(left?.Trim(), right?.Trim(), StringComparison.OrdinalIgnoreCase);
     private static bool SameState(string? left, string? right) => Same(NormalizeState(left), NormalizeState(right));
-    private static string? NormalizeState(string? state) => Same(state, "NH") ? "New Hampshire" : state;
+    private static string? NormalizeState(string? state) => state is null ? null : StreetGeocoder.StateCode(state);
     public void Dispose() { gate.Dispose(); cache.Dispose(); }
 }

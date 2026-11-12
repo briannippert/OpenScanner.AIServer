@@ -7,7 +7,7 @@ Unlike a per-clip `whisper-cli` invocation, this server keeps models **resident 
 ## Prerequisites
 
 - A Linux machine (Ubuntu/Debian recommended) with a GPU or fast CPU
-- The installer handles everything else (.NET SDK, whisper.cpp, model download)
+- The installer handles .NET, whisper.cpp, Ollama, and both model downloads
 
 ## Quick Start
 
@@ -24,16 +24,63 @@ The installer will:
 2. Prompt you to select a default Whisper model (pre-warmed at startup)
 3. Prompt you to choose a port (default: 8090)
 4. Clone and build whisper.cpp — including `whisper-server` — (with CUDA if an NVIDIA GPU is detected)
-5. Download your chosen model
-6. Build the .NET server
-7. Configure and start a systemd service
+5. Install/start Ollama and select a metadata/address LLM (keep the configured model, default `qwen3:4b`)
+6. Download missing models and verify Whisper loading plus LLM structured JSON output
+7. Build the .NET server
+8. Configure and start the application service, ordered after managed local Ollama
 
 ### Installer Options
 
 - `--skip-update`: Build local code without pulling main (use this when installing a feature branch)
-- `--deps-only`: Install dependencies and download the model, then exit without building or installing the service
+- `--deps-only`: Set up dependencies, Ollama, and both model downloads/checks, then exit without building/deploying the application. A previously running Whisper service is restored.
 - `--port=NNNN`: Set the listening port (skips the interactive prompt)
 - `--rebuild-whisper`: Force a clean rebuild of whisper.cpp (useful after installing CUDA)
+- `--llm-model=NAME`: Select the Ollama model without its interactive prompt (`--ollama-model` is an alias)
+- `--ollama-url=URL`: Override the Ollama origin; otherwise use `Address.OllamaUrl` (or `Address__OllamaUrl`)
+- `--upgrade-ollama`: Force an upgrade of the managed local Ollama installation using the official installer
+- `--skip-ollama`: Leave Ollama and `Address` settings unchanged; run only the existing Whisper/application setup
+- `--help`: Show all installer options without sudo
+
+For this checkout on port 8099:
+
+```bash
+bash scripts/install_service.sh --skip-update --port=8099 --llm-model=qwen3:4b
+```
+
+The LLM prompt offers `qwen3:4b`, `qwen3:1.7b`, or a custom model. Enter keeps
+`Address.Model` (or `Address__Model`). The explicit CLI model takes precedence.
+Whisper model selection remains separate. A model is downloaded only if missing;
+Ollama verifies downloads and the installer then tests loading with the same
+4,096-token context, `think=false`, and JSON Schema support used by the API. The
+short probe unloads the LLM afterward so Whisper startup can use the GPU. Model
+and URL settings are saved only after verification succeeds.
+
+For a local HTTP loopback endpoint with an explicit port, the installer installs
+Ollama if its CLI/service is missing, starts/enables `ollama.service`, and writes
+`/etc/systemd/system/ollama.service.d/openscanner.conf`. This binds to loopback and
+sets `OLLAMA_NUM_PARALLEL=1` and `OLLAMA_MAX_LOADED_MODELS=1`. Other drop-ins are
+preserved. Current Ollama is retained unless `--upgrade-ollama` is supplied or a
+model download reports that a newer version is required; in that case the official
+[Linux installer](https://docs.ollama.com/linux) is run once and setup retries.
+The required download tools (`curl`, CA certificates, `zstd`) are installed first.
+
+For a configured remote URL or HTTPS reverse proxy, only model download and the
+API verification run against that endpoint. Its local installation and service are
+not changed. Remote upgrades must be performed on that host. URLs must be HTTP(S)
+origins without credentials, paths, query strings, or fragments. Loopback ports
+managed by this installer must be 1024–65535. `--skip-ollama` cannot be combined
+with model, URL, or Ollama upgrade options.
+
+If a setup step fails, the installer attempts to restart a Whisper service that
+was running beforehand. This restores availability; it is not a transactional
+rollback of dependencies or configuration already installed. Uninstalling the
+Whisper service leaves Ollama and its model cache installed, since other apps may
+use them.
+
+Installer checks: `bash -n scripts/install_service.sh scripts/setup_ollama.sh` and
+`python3 scripts/test_ollama_setup.py`. The provisioning suite uses local HTTP and
+mock system commands; it never changes real services, `/etc`, packages, or models.
+
 
 ### GPU Acceleration
 
@@ -281,6 +328,19 @@ Stable call types for filters: `traffic_stop`, `traffic_collision`, `fire`, `med
 `rescue`, `alarm`, `assault`, `domestic_disturbance`, `theft`, `burglary`,
 `suspicious_activity`, `welfare_check`, `disturbance`, `hazard`, `public_assistance`,
 `other`. `other` represents substantive incident information with an unknown type.
+For this application's agency policy, `welfare_check` is a police category.
+Fire-service results never return it: patient complaints (including faintness) are
+`medical`, practical nonmedical help is `public_assistance`, and an unspecified
+incident type is `other`. The model schema excludes welfare checks when fire
+context is supplied; a server check also enforces the rule for inferred fire context.
+
+“Fire alarm” commonly identifies dispatch in phrases like “Fire alarm to all
+companies” or “Engine 1 to Fire alarm”. Radio-address syntax is normalized to
+“Dispatch” for classification. A location plus an MDT-message update, without a
+stated incident type, is `other`. Actual activated alarms, alarm investigations,
+and resets remain `alarm`; the dispatch identifier does not override a medical
+complaint or reported structure fire.
+
 `incidentStatus` is `dispatched`, `en_route`, `on_scene`, `cleared`, or null, based
 on explicit statements. Classification and summaries are model interpretations.
 
@@ -332,8 +392,9 @@ coordinates in the database as incident coordinates.
 
 `POST /address` accepts JSON text, extracts a location, and automatically resolves
 its address and coordinates when possible. Extraction uses a separately
-running local [Ollama](https://ollama.com/) service; the Whisper installer does not
-install Ollama or download the LLM. After installing and starting Ollama on the server:
+running [Ollama](https://ollama.com/) service. The installer now provisions local
+Ollama and the configured LLM automatically. For an externally managed setup or
+when using `--skip-ollama`, install/start Ollama separately and download the model:
 
 ```bash
 ollama pull qwen3:4b
@@ -376,9 +437,38 @@ selected provider match (including `matchedAddress`, numeric `latitude` and
 responses, timeouts, and ambiguous results do not discard the extracted address:
 `/address` still returns HTTP 200 with `geocode: null`.
 
-For street addresses, the server calls Census automatically. When Census returns
-no matches and a house number and street are available, it can search Photon for
-similar street names in the requested city/state. Street type and directional
+For street addresses, the server calls Census automatically. If Census has no
+match, a full-address Photon search can resolve a unique OSM address/building.
+It must return the exact house number, a normalized exact street name, and the
+requested US city/state. Street-only search results and neighboring house numbers
+are rejected; multiple distinct matching points remain unresolved. No business
+name or Census coverage is required for a verified numbered OSM building.
+
+For example, `3 Artisan Drive, Salem, NH` resolves through Photon to the OSM
+apartment building at approximately 42.7715374, -71.2288257. The returned point
+represents the building, not apartment 204 or a confirmed entrance. The original
+extracted address and unit remain unchanged.
+
+`geocode.precision` distinguishes `building` (OSM building with matching address),
+`address` (an address point or Census address-range interpolation), `place`
+(a business/landmark lookup), and `street` (an approximate mapped-street point). `geocode.provider` identifies the coordinate source.
+These fields are additive and are documented in Swagger and the JSON Schema.
+Building precision does not guarantee rooftop/entrance accuracy. Street-level points are never presented as numbered addresses.
+
+For a transmission naming a street without a house number, lookup can return an
+approximate street pin with `precision: "street"`, `houseNumber: null`, and Photon
+attribution. It requires the exact normalized street name and requested US town/state;
+similar names in other towns and invalid/missing points are rejected. Among available
+segments of that named street, it selects a provider point near the center of their
+combined mapped bounds. This is not a measured midpoint of the entire street or the
+reported person's position. A partial cross street such as “Lake” is preserved as
+text and is not treated as a verified intersection. The original location fields
+remain unchanged. Numbered addresses continue to require an address/building match.
+OpenScanner should label `precision: "street"` pins as approximate street locations.
+
+If no full-address building candidates exist, street-spelling repair runs next.
+When a house number and street are present, it searches Photon for similar street
+names in the requested city/state. Street type and directional
 prefixes must agree; name edits are bounded. If cross streets were extracted,
 each must have a similar local street whose bounding box is near the candidate
 street. This is proximity evidence, not proof that the roads intersect. The
@@ -396,6 +486,13 @@ The fallback is used by automatic enrichment on `/address`, `/transmission`, and
 requests are serialized/rate limited, use the geocoding timeout, and cache results
 for 24 hours by number, street, locality and cross streets. Additional requests
 can add latency. Only extracted location information is sent to providers.
+
+Location lookup rejects model-generated place names absent from the source text.
+An explicit house number and street take precedence over a business lookup, and
+selected coordinates must agree with that number and a compatible street name.
+A conflicting provider/business result leaves coordinates unresolved and preserves
+the extracted address. For example, `44 Millville Street` must never acquire the
+local Dollar Tree directory entry at `294 N Broadway`.
 
 For business names, lookup checks the configured local directory, then
 Photon/OpenStreetMap. The original text is supplied only to the local LLM for
@@ -432,9 +529,10 @@ These settings trade transcription concurrency/model caching for memory and are
 now the repository defaults. The installer subtracts `Address:ReservedVramMb`
 (default 3500 MB) before sizing the Whisper pool, in addition to driver headroom.
 This is only an estimate: it does not reserve GPU memory at runtime. Set it to 0
-when Ollama runs on another machine or address extraction is unused. Set `OLLAMA_NUM_PARALLEL=1` and
-`OLLAMA_MAX_LOADED_MODELS=1` in the **Ollama service environment**, then restart
-Ollama. Test simultaneous transcription and address extraction with `nvidia-smi`
+when Ollama runs on another machine or address extraction is unused. The installer
+sets `OLLAMA_NUM_PARALLEL=1` and `OLLAMA_MAX_LOADED_MODELS=1` for managed local
+Ollama. For external setups, configure those values in the Ollama service environment
+and restart Ollama. Test simultaneous transcription and address extraction with `nvidia-smi`
 and check `ollama ps` for GPU placement. If memory is too tight, try `qwen3:1.7b`
 (download it and change `Address:Model`). Models stay warm for five minutes after use.
 
@@ -591,3 +689,19 @@ providers to exercise locality, cross-street proximity, ambiguity, number
 preservation, outages and caching. `python3 scripts/test_shepherd_live.py
 http://127.0.0.1:8099` checks the actual cardiac-arrest transmission against Ollama,
 Photon and Census; it requires those services to be available.
+
+`python3 scripts/test_dispatch_identifier_live.py http://127.0.0.1:8099` checks
+radio dispatch identifiers versus actual alarm/fire/medical calls, faintness,
+fire-service category policy, and independent numbered street extraction using
+real Ollama. Geocoding may be unavailable for these classification checks.
+
+`python3 scripts/test_artisan_live.py http://127.0.0.1:8099` verifies the original
+Artisan Drive medical dispatch with real Ollama, Census and Photon. The mocked
+street fallback suite also covers exact building matches, ambiguity, duplicates,
+wrong numbers/streets/localities, street-centroid rejection and provider outages.
+
+`python3 scripts/test_street_center_live.py http://127.0.0.1:8099` verifies the
+Bluff Street police transmission with a real approximate street pin. The mocked
+fallback suite includes street-center locality isolation, multiple segments,
+exact-name matching, missing/invalid points, and cache reuse; its center checks
+can also run with `--centers-only`.

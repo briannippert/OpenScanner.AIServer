@@ -13,15 +13,31 @@ public sealed class LocationEnricher(GeocodeResolver resolver, PlaceGeocoder pla
         GeocodeMatch? geocode = null;
         var address = fields["address"];
         var placeName = fields["placeName"];
+        // A model example or a previous call must never introduce a business into
+        // a different transmission and route its lookup through the local directory.
+        if (!string.IsNullOrWhiteSpace(placeName) && !Mentioned(placeName, text))
+        {
+            placeName = fields["placeName"] = null;
+            logger.LogWarning("Discarded a place name absent from the transmission");
+        }
+        var numberedStreet = !string.IsNullOrWhiteSpace(fields["houseNumber"]) &&
+            !string.IsNullOrWhiteSpace(fields["street"]);
+        var usePlaceLookup = !numberedStreet && !string.IsNullOrWhiteSpace(placeName) && placeName.Length <= 500;
+        var streetOnly = string.IsNullOrWhiteSpace(fields["houseNumber"]) && !string.IsNullOrWhiteSpace(fields["street"]) && !usePlaceLookup;
         if ((!string.IsNullOrWhiteSpace(address) && address.Length <= 500) ||
-            (!string.IsNullOrWhiteSpace(placeName) && placeName.Length <= 500))
+            (!string.IsNullOrWhiteSpace(placeName) && placeName.Length <= 500) || streetOnly)
         {
             try
             {
                 GeocodeResponse resolved;
-                if (!string.IsNullOrWhiteSpace(placeName) && placeName.Length <= 500)
-                    resolved = await resolver.ResolvePlaceAsync(placeName, city, state,
+                if (usePlaceLookup)
+                    resolved = await resolver.ResolvePlaceAsync(placeName!, city, state,
                         text, ct);
+                else if (streetOnly)
+                {
+                    geocode = await streets.ResolveCenterAsync(fields["street"]!, city, state, ct);
+                    resolved = new GeocodeResponse(false, []);
+                }
                 else
                 {
                     var query = string.Join(", ", new[] { address,
@@ -31,12 +47,34 @@ public sealed class LocationEnricher(GeocodeResolver resolver, PlaceGeocoder pla
                     resolved = await resolver.ResolveAsync(query, text, ct);
                     if (resolved.Matches.Count == 0 && !string.IsNullOrWhiteSpace(fields["houseNumber"]) &&
                         !string.IsNullOrWhiteSpace(fields["street"]))
-                        geocode = await streets.ResolveAsync(fields["houseNumber"]!, fields["street"]!,
-                            city, state,
-                            fields["crossStreet"], ct);
+                    {
+                        // A verified OSM building does not require Census coverage. Only
+                        // fall through to street-name repair when no building candidates exist.
+                        try
+                        {
+                            var building = await places.SearchAddressAsync(fields["houseNumber"]!, fields["street"]!, city, state, ct);
+                            geocode = building.SelectedMatch;
+                            if (building.Matches.Count > 0)
+                                resolved = building;
+                        }
+                        catch (Exception ex) when (ex is HttpRequestException or System.Text.Json.JsonException ||
+                            ex is OperationCanceledException && !ct.IsCancellationRequested)
+                        {
+                            logger.LogWarning("Building lookup unavailable ({FailureType}); trying street lookup", ex.GetType().Name);
+                        }
+                        if (resolved.Matches.Count == 0)
+                            geocode = await streets.ResolveAsync(fields["houseNumber"]!, fields["street"]!,
+                                city, state, fields["crossStreet"], ct);
+                    }
                 }
                 geocode ??= resolved.SelectedMatch;
-                if (geocode is not null && !string.IsNullOrWhiteSpace(placeName))
+                if (geocode is not null && !string.IsNullOrWhiteSpace(fields["houseNumber"]) &&
+                    !MatchesNumberedAddress(fields["houseNumber"]!, fields["street"], geocode))
+                {
+                    geocode = null;
+                    logger.LogWarning("Discarded a geocode conflicting with the extracted numbered street");
+                }
+                if (geocode is not null && usePlaceLookup)
                 {
                     fields["address"] = geocode.MatchedAddress;
                     fields["houseNumber"] = geocode.HouseNumber ?? fields["houseNumber"];
@@ -62,4 +100,22 @@ public sealed class LocationEnricher(GeocodeResolver resolver, PlaceGeocoder pla
     private static bool ContainsLocality(string address, string value) =>
         address.Split(',').Skip(1).Any(part =>
             Regex.IsMatch(part, @"\b" + Regex.Escape(value) + @"\b", RegexOptions.IgnoreCase));
+
+    private static bool Mentioned(string name, string text)
+    {
+        var words = Regex.Matches(name, @"[\p{L}\p{N}]+").Select(m => Regex.Escape(m.Value)).ToArray();
+        return words.Length > 0 && Regex.IsMatch(text, @"\b" + string.Join(@"[\W_]+", words) + @"\b",
+            RegexOptions.IgnoreCase);
+    }
+
+    private static bool MatchesNumberedAddress(string house, string? street, GeocodeMatch match)
+    {
+        var firstLine = match.MatchedAddress.Split(',')[0].Trim();
+        var parsed = Regex.Match(firstLine, @"^(?<house>\d+[A-Za-z]?(?:-\d+)?)\s+(?<street>.+)$");
+        var matchedHouse = match.HouseNumber ?? (parsed.Success ? parsed.Groups["house"].Value : null);
+        if (!string.Equals(house.Trim(), matchedHouse?.Trim(), StringComparison.OrdinalIgnoreCase)) return false;
+        if (string.IsNullOrWhiteSpace(street)) return true;
+        var matchedStreet = match.Street ?? (parsed.Success ? parsed.Groups["street"].Value : null);
+        return matchedStreet is not null && StreetGeocoder.Similar(street, matchedStreet);
+    }
 }

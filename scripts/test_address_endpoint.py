@@ -43,6 +43,8 @@ class Backend(http.server.BaseHTTPRequestHandler):
             {'matchedAddress': '123 MAIN ST, NORTH CITY, VA', 'coordinates': {'x': -77.1, 'y': 38.9}}]
         if address == 'ambiguous':
             matches.append({'matchedAddress': '123 MAIN ST, SOUTH CITY, VA', 'coordinates': {'x': -77.2, 'y': 38.8}})
+        if address.startswith('44 Millville Street'):
+            matches[0]['matchedAddress'] = '44 MILLVILLE ST, SALEM, NH, 03079'
         if address.startswith('294 N Broadway'):
             matches[0]['matchedAddress'] = '294 N BROADWAY, SALEM, NH, 03079'
         if address == 'invalid': del matches[0]['coordinates']['x']
@@ -83,6 +85,7 @@ class Backend(http.server.BaseHTTPRequestHandler):
                 result.update(callType='medical', summary='Medical call at 9 Pine St, Concord, NH.', address='9 Pine St',
                               houseNumber='9', street='Pine St', city='Concord', state='NH')
             if text.startswith('business '): result.update(callType='other', summary='Incident at a business.', placeName=text.removeprefix('business '))
+            if text == 'welfare policy': result.update(callType='welfare_check', service='fire', summary='Check on a person.')
             if text == 'bad-category': result.update(callType='invented', summary='Test')
             content = '{}' if text == 'invalid' else json.dumps(result)
             self.send_response(200); self.send_header('Content-Type', 'application/json'); self.end_headers()
@@ -104,6 +107,13 @@ class Backend(http.server.BaseHTTPRequestHandler):
         if text=='timeout': time.sleep(2); return
         result=dict.fromkeys(fields)
         if text=='123 Main St': result.update(address=text, houseNumber='123', street='Main St')
+        if text in ('guard invented place', 'Coffee Place at 44 Millville Street'):
+            result.update(address='44 Millville Street', houseNumber='44', street='Millville Street',
+                placeName='Dollar Tree' if text == 'guard invented place' else 'Coffee Place')
+        if text == 'guard place only': result['placeName'] = 'Dollar Tree'
+        if text == 'guard wrong number': result.update(address='44 Mismatch Street', houseNumber='44', street='Mismatch Street')
+        if text == 'guard wrong street': result.update(address='123 Mismatch Street', houseNumber='123', street='Mismatch Street')
+
         if text.startswith('auto '):
             query = text.split()[1]
             result.update(address=query, houseNumber='123', street='Main St')
@@ -208,6 +218,9 @@ with tempfile.TemporaryFile(mode='w+') as log:
         assert len(geocode_calls) + len(place_calls) == count
         assert transmission('', 'fire')[0] == 400
         assert transmission('test', 'ems')[0] == 400
+        assert transmission('welfare policy', 'fire')[1]['callType'] == 'public_assistance'
+        assert transmission('welfare policy', 'police')[1]['callType'] == 'welfare_check'
+        assert transmission('welfare policy')[1]['callType'] == 'public_assistance'
         status, value = transmission('traffic stop', ' FIRE ')
         assert status == 200 and value['service'] == 'fire' and value['callType'] == 'traffic_stop'
         assert value['location']['houseNumber'] == '123' and value['location']['geocode']['latitude'] == 38.9
@@ -315,5 +328,21 @@ with tempfile.TemporaryFile(mode='w+') as log:
         print('PASS: automatic address geocoding, contextual selection, no-address skip, and failure fallback')
         assert all(b[1] - a[1] >= .95 for a, b in zip(geocode_calls, geocode_calls[1:]))
         print('PASS: geocoding validation, encoding, coordinates, caching, throttling, failures, and LLM selection/fallback')
+        place_count = len(place_calls)
+        for text in ['guard invented place', 'Coffee Place at 44 Millville Street']:
+            status, result = request({'text': text})
+            assert status == 200 and result['houseNumber'] == '44' and result['street'] == 'Millville Street'
+            assert result['address'] == '44 Millville Street'
+            assert result['geocode']['matchedAddress'] == '44 MILLVILLE ST, SALEM, NH, 03079'
+        assert len(place_calls) == place_count
+        count = len(geocode_calls)
+        status, result = request({'text': 'guard place only'})
+        assert status == 200 and result['placeName'] is None and result['geocode'] is None
+        assert len(geocode_calls) == count and len(place_calls) == place_count
+        for text in ['guard wrong number', 'guard wrong street']:
+            status, result = request({'text': text})
+            assert status == 200 and result['geocode'] is None
+            assert result['address'].endswith('Mismatch Street')
+        print('PASS: invented business rejection, explicit street precedence, and mismatched number/street rejection')
         print('PASS: 10 endpoint checks (validation, extraction, no address, invalid/truncated JSON, backend failure, timeout)')
     finally: app.terminate(); app.wait(timeout=10); backend.shutdown(); backend.server_close(); assets.cleanup()

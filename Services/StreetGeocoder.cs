@@ -12,7 +12,8 @@ public sealed class StreetGeocoder(IHttpClientFactory clients, IConfiguration co
     private readonly SemaphoreSlim gate = new(1, 1);
     private readonly MemoryCache cache = new(new MemoryCacheOptions { SizeLimit = 1000 });
     private long nextRequestAt;
-    private sealed record Road(string Name, double West, double South, double East, double North);
+    private sealed record Road(string Name, double West, double South, double East, double North,
+        double? Longitude = null, double? Latitude = null);
     private static readonly Dictionary<string, string> Suffixes = new(StringComparer.OrdinalIgnoreCase)
     {
         ["avenue"] = "ave", ["street"] = "st", ["road"] = "rd", ["drive"] = "dr",
@@ -22,6 +23,46 @@ public sealed class StreetGeocoder(IHttpClientFactory clients, IConfiguration co
     };
     private static readonly string[] StateNames =
         "AL:Alabama|AK:Alaska|AZ:Arizona|AR:Arkansas|CA:California|CO:Colorado|CT:Connecticut|DE:Delaware|DC:District of Columbia|FL:Florida|GA:Georgia|HI:Hawaii|ID:Idaho|IL:Illinois|IN:Indiana|IA:Iowa|KS:Kansas|KY:Kentucky|LA:Louisiana|ME:Maine|MD:Maryland|MA:Massachusetts|MI:Michigan|MN:Minnesota|MS:Mississippi|MO:Missouri|MT:Montana|NE:Nebraska|NV:Nevada|NH:New Hampshire|NJ:New Jersey|NM:New Mexico|NY:New York|NC:North Carolina|ND:North Dakota|OH:Ohio|OK:Oklahoma|OR:Oregon|PA:Pennsylvania|RI:Rhode Island|SC:South Carolina|SD:South Dakota|TN:Tennessee|TX:Texas|UT:Utah|VT:Vermont|VA:Virginia|WA:Washington|WV:West Virginia|WI:Wisconsin|WY:Wyoming".Split('|');
+
+    public async Task<GeocodeMatch?> ResolveCenterAsync(string street, string city, string state, CancellationToken ct)
+    {
+        if (street.Length > 150 || city.Length > 100 || state.Length > 100) return null;
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        deadline.CancelAfter(TimeSpan.FromSeconds(Math.Clamp(config.GetValue("Geocoding:TimeoutSeconds", 30), 1, 300)));
+        ct = deadline.Token;
+        var key = "center:" + JsonSerializer.Serialize(new[] { street, city, state }).ToUpperInvariant();
+        await gate.WaitAsync(ct);
+        try
+        {
+            if (cache.TryGetValue<GeocodeResponse>(key, out var cached)) return cached!.SelectedMatch;
+            // Approximate pins require the actual named street, not a fuzzy alternative.
+            var roads = (await FindRoadsAsync(street, city, state, ct)).Where(r => SameStreet(r.Name, street) &&
+                r.Longitude.HasValue && r.Latitude.HasValue).ToList();
+            GeocodeMatch? match = null;
+            if (roads.Count > 0)
+            {
+                var west = roads.Min(r => r.West); var east = roads.Max(r => r.East);
+                var south = roads.Min(r => r.South); var north = roads.Max(r => r.North);
+                if (east - west <= .1 && north - south <= .1)
+                {
+                    var x = (west + east) / 2; var y = (south + north) / 2;
+                    // Choose a provider's mapped point near the center of the available
+                    // street segments, rather than inventing a numbered address/intersection.
+                    var road = roads.OrderBy(r => Math.Pow((r.Longitude!.Value - x) * Math.Cos(y * Math.PI / 180), 2) +
+                        Math.Pow(r.Latitude!.Value - y, 2)).First();
+                    match = new GeocodeMatch($"{road.Name}, {city}, {StateCode(state)}", road.Latitude!.Value,
+                        road.Longitude!.Value, Street: road.Name, City: city, State: StateCode(state), Country: "US",
+                        Attribution: "© OpenStreetMap contributors — https://www.openstreetmap.org/copyright",
+                        Precision: "street", Provider: "Photon / OpenStreetMap");
+                }
+            }
+            var result = new GeocodeResponse(match is not null, match is null ? [] : [match], "Photon / OpenStreetMap",
+                match is null ? null : 0, match is null ? "no_match" : "approximate_street");
+            cache.Set(key, result, new MemoryCacheEntryOptions { Size = 1, AbsoluteExpirationRelativeToNow = TimeSpan.FromHours(24) });
+            return match;
+        }
+        finally { gate.Release(); }
+    }
 
     public async Task<GeocodeMatch?> ResolveAsync(string house, string street, string city,
         string state, string? crossStreet, CancellationToken ct)
@@ -125,7 +166,15 @@ public sealed class StreetGeocoder(IHttpClientFactory clients, IConfiguration co
                     bounds[1] is < -90 or > 90 || bounds[3] is < -90 or > 90 ||
                     bounds[0] > bounds[2] || bounds[3] > bounds[1] ||
                     bounds[2] - bounds[0] > .1 || bounds[1] - bounds[3] > .1) continue;
-                roads.Add(new Road(name, bounds[0], bounds[3], bounds[2], bounds[1]));
+                double? longitude = null, latitude = null;
+                if (feature.TryGetProperty("geometry", out var geometry) && geometry.ValueKind == JsonValueKind.Object &&
+                    Text(geometry, "type") == "Point" && geometry.TryGetProperty("coordinates", out var xy) &&
+                    xy.ValueKind == JsonValueKind.Array && xy.GetArrayLength() == 2 &&
+                    xy[0].ValueKind == JsonValueKind.Number && xy[0].TryGetDouble(out var lon) && double.IsFinite(lon) &&
+                    xy[1].ValueKind == JsonValueKind.Number && xy[1].TryGetDouble(out var lat) && double.IsFinite(lat) &&
+                    lon >= bounds[0] && lon <= bounds[2] && lat >= bounds[3] && lat <= bounds[1])
+                { longitude = lon; latitude = lat; }
+                roads.Add(new Road(name, bounds[0], bounds[3], bounds[2], bounds[1], longitude, latitude));
             }
         }
         return roads;
@@ -135,8 +184,10 @@ public sealed class StreetGeocoder(IHttpClientFactory clients, IConfiguration co
         a.South <= b.North + .0003 && a.North + .0003 >= b.South;
     private static string Normalize(string value) => string.Join(" ", Regex.Matches(value.ToLowerInvariant(), @"[\p{L}\p{N}]+")
         .Select(m => Suffixes.GetValueOrDefault(m.Value, m.Value)));
-    private static bool Similar(string input, string candidate)
+    internal static bool SameStreet(string left, string right) => Normalize(left) == Normalize(right);
+    internal static bool Similar(string input, string candidate)
     {
+        if (Normalize(input) == Normalize(candidate)) return true;
         var a = Normalize(input).Split(' ');
         var b = Normalize(candidate).Split(' ');
         // Require compatible road type and directional prefixes; only the name may vary.
@@ -159,7 +210,7 @@ public sealed class StreetGeocoder(IHttpClientFactory clients, IConfiguration co
         item.ValueKind == JsonValueKind.String ? item.GetString() : null;
     private static bool Same(string? a, string? b) => string.Equals(a?.Trim(), b?.Trim(), StringComparison.OrdinalIgnoreCase);
     private static bool SameState(string? a, string? b) => a is not null && b is not null && Same(StateCode(a), StateCode(b));
-    private static string StateCode(string value) => StateNames.Select(s => s.Split(':'))
+    internal static string StateCode(string value) => StateNames.Select(s => s.Split(':'))
         .FirstOrDefault(p => Same(p[0], value) || Same(p[1], value))?[0] ?? value.Trim();
     public void Dispose() { gate.Dispose(); cache.Dispose(); }
 }

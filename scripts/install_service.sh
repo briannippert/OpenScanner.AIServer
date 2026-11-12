@@ -5,7 +5,7 @@ set -e
 # OpenScanner WhisperServer Installer
 # =====================================================
 # Installs system dependencies, builds whisper.cpp,
-# downloads a Whisper model, builds the .NET server,
+# downloads Whisper and Ollama models, builds the .NET server,
 # and configures a systemd service.
 # =====================================================
 
@@ -28,6 +28,10 @@ DEPS_ONLY=false
 REBUILD_WHISPER=false
 PORT=""
 SKIP_UPDATE=false
+SKIP_OLLAMA=false
+UPGRADE_OLLAMA=false
+LLM_MODEL_CHOICE=""
+OLLAMA_URL_CHOICE=""
 for arg in "$@"; do
   case $arg in
     --skip-update)
@@ -46,8 +50,41 @@ for arg in "$@"; do
       REBUILD_WHISPER=true
       shift
       ;;
+    --skip-ollama)
+      SKIP_OLLAMA=true
+      ;;
+    --upgrade-ollama)
+      UPGRADE_OLLAMA=true
+      ;;
+    --llm-model=*|--ollama-model=*)
+      LLM_MODEL_CHOICE="${arg#*=}"
+      ;;
+    --ollama-url=*)
+      OLLAMA_URL_CHOICE="${arg#*=}"
+      ;;
+    --help|-h)
+      cat <<'EOF'
+Usage: bash scripts/install_service.sh [options]
+  --skip-update          Use local source without pulling main
+  --deps-only            Set up dependencies and both model runtimes; skip app deployment
+  --port=NNNN            Application port (otherwise prompted)
+  --rebuild-whisper      Clean and rebuild whisper.cpp
+  --llm-model=NAME       Ollama model (otherwise prompt; keep configured model by default)
+  --ollama-url=URL       Ollama origin (otherwise use Address.OllamaUrl)
+  --upgrade-ollama       Force an official Ollama upgrade on the managed local host
+  --skip-ollama          Skip all Ollama/model setup; preserve Address configuration
+EOF
+      exit 0
+      ;;
+    *) log_error "Unknown option: $arg (use --help)"; exit 1 ;;
   esac
 done
+
+if [ "$SKIP_OLLAMA" = true ] && { [ "$UPGRADE_OLLAMA" = true ] ||
+    [ -n "$LLM_MODEL_CHOICE" ] || [ -n "$OLLAMA_URL_CHOICE" ]; }; then
+    log_error "--skip-ollama cannot be combined with Ollama model, URL or upgrade options."
+    exit 1
+fi
 
 # Check NOT Root
 if [ "$EUID" -eq 0 ]; then
@@ -75,7 +112,20 @@ log_info "User: $USER ($HOME)"
 # 1. Stop Existing Service
 # ----------------------------------------------------------------
 log_step "Stopping existing service..."
+WAS_RUNNING=false
+SERVICE_RESTARTED=false
+restore_existing_service() {
+    local result=$?
+    trap - EXIT
+    if [ "$WAS_RUNNING" = true ] && [ "$SERVICE_RESTARTED" = false ]; then
+        log_info "Restoring the previously running Whisper service..."
+        sudo systemctl start openscanner-whisper || log_warn "Could not restore the service; check systemctl status openscanner-whisper."
+    fi
+    exit "$result"
+}
+trap restore_existing_service EXIT
 if systemctl is-active --quiet openscanner-whisper; then
+    WAS_RUNNING=true
     sudo systemctl stop openscanner-whisper
     log_info "Service stopped."
 else
@@ -140,7 +190,7 @@ fi
 log_step "Installing System Libraries..."
 
 sudo apt-get update -qq || log_warn "apt-get update encountered errors. Attempting to continue..."
-sudo apt-get install -y -qq git cmake build-essential ffmpeg jq > /dev/null
+sudo apt-get install -y -qq git cmake build-essential ffmpeg jq curl ca-certificates zstd > /dev/null
 log_success "Libraries installed."
 
 # Install NVIDIA CUDA toolkit if GPU is present but nvcc is missing
@@ -201,6 +251,19 @@ if [ -z "$PORT" ]; then
 fi
 
 log_info "Using port: $PORT"
+
+# ----------------------------------------------------------------
+# 5c. Ollama and metadata/address model
+# ----------------------------------------------------------------
+OLLAMA_MANAGED_LOCAL=false
+if [ "$SKIP_OLLAMA" = true ]; then
+    log_info "Skipping Ollama setup (--skip-ollama); Address configuration is unchanged."
+else
+    log_step "Setting up Ollama and the metadata LLM..."
+    # shellcheck source=setup_ollama.sh
+    source "$PROJECT_ROOT/scripts/setup_ollama.sh"
+    setup_ollama "$APPSETTINGS" "$LLM_MODEL_CHOICE" "$OLLAMA_URL_CHOICE" "$UPGRADE_OLLAMA"
+fi
 
 # ----------------------------------------------------------------
 # 6. Whisper.cpp Setup
@@ -380,7 +443,7 @@ log_info "  Default:      $WHISPER_MODEL"
 log_info "  Instances:    $INSTANCES per model  (max $MAXMODELS resident model(s), GPU=$USE_GPU)"
 
 if [ "$DEPS_ONLY" = true ]; then
-    log_success "Dependencies installed. Skipping build and service installation (--deps-only)."
+    log_success "Dependencies and models ready. Skipping app build and service installation (--deps-only)."
     exit 0
 fi
 
@@ -408,10 +471,12 @@ NET_EXEC="$PROJECT_ROOT/bin/Release/net10.0/publish/OpenScanner.WhisperServer"
 chmod +x "$NET_EXEC"
 
 TEMP_SERVICE_FILE=$(mktemp)
+OLLAMA_AFTER=""
+if [ "$OLLAMA_MANAGED_LOCAL" = true ]; then OLLAMA_AFTER=" ollama.service"; fi
 cat <<EOF > "$TEMP_SERVICE_FILE"
 [Unit]
 Description=OpenScanner Whisper Transcription Server
-After=network.target
+After=network.target$OLLAMA_AFTER
 
 [Service]
 Type=simple
@@ -434,6 +499,7 @@ sudo chmod 644 "$SERVICE_FILE"
 sudo systemctl daemon-reload
 sudo systemctl enable openscanner-whisper
 sudo systemctl restart openscanner-whisper
+SERVICE_RESTARTED=true
 
 # ----------------------------------------------------------------
 # 10. Finalize
@@ -448,6 +514,9 @@ echo "================================================="
 log_success "Installation Complete!"
 echo "================================================="
 echo -e "   ${BOLD}Model:${NC}   $WHISPER_MODEL"
+if [ "$SKIP_OLLAMA" = false ]; then
+    echo -e "   ${BOLD}LLM:${NC}     $LLM_MODEL ($OLLAMA_URL)"
+fi
 echo -e "   ${BOLD}Port:${NC}    $PORT"
 echo -e "   ${BOLD}Status:${NC}  systemctl status openscanner-whisper"
 echo -e "   ${BOLD}Logs:${NC}    journalctl -u openscanner-whisper -f"
