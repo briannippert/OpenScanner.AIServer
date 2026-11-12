@@ -1,7 +1,21 @@
+using OpenScanner.WhisperServer.Api;
+using Microsoft.OpenApi;
 using OpenScanner.WhisperServer.Services;
 
 var builder = WebApplication.CreateBuilder(args);
 
+builder.Services.AddEndpointsApiExplorer();
+builder.Services.AddSwaggerGen(options =>
+{
+    options.SwaggerDoc("v1", new OpenApiInfo
+    {
+        Title = "OpenScanner Whisper Server",
+        Version = "v1",
+        Description = "Local audio transcription and address extraction."
+    });
+    options.SupportNonNullableReferenceTypes();
+    options.OperationFilter<TranscriptionOperationFilter>();
+});
 builder.Services.AddHttpClient();
 builder.Services.AddHttpClient("address", client => client.Timeout = Timeout.InfiniteTimeSpan);
 builder.Services.AddSingleton<AddressExtractor>();
@@ -22,6 +36,8 @@ builder.Services.AddCors(options =>
 var app = builder.Build();
 
 app.UseCors();
+app.UseSwagger();
+app.UseSwaggerUI(options => options.SwaggerEndpoint("v1/swagger.json", "OpenScanner API v1"));
 
 app.MapGet("/health", (WhisperServerPool pool) =>
 {
@@ -39,7 +55,10 @@ app.MapGet("/health", (WhisperServerPool pool) =>
         gpu = hw.Gpu,
         gpuMemoryMb = hw.GpuMemoryMb
     });
-});
+})
+.WithName("GetHealth").WithTags("Server")
+.WithSummary("Get Whisper readiness and hardware information")
+.Produces<HealthResponse>();
 
 app.MapGet("/models", (WhisperServerPool pool) =>
 {
@@ -47,7 +66,10 @@ app.MapGet("/models", (WhisperServerPool pool) =>
         .Select(id => new { id, label = id })
         .ToList();
     return Results.Ok(new { models });
-});
+})
+.WithName("GetModels").WithTags("Server")
+.WithSummary("List installed Whisper models")
+.Produces<ModelsResponse>();
 
 app.MapPost("/transcribe", async (HttpRequest request, WhisperServerPool pool, ILogger<Program> logger) =>
 {
@@ -102,7 +124,11 @@ app.MapPost("/transcribe", async (HttpRequest request, WhisperServerPool pool, I
     {
         if (File.Exists(tempPath)) File.Delete(tempPath);
     }
-});
+})
+.WithName("Transcribe").WithTags("Transcription")
+.WithSummary("Transcribe a WAV audio upload")
+.Produces<TranscriptionResponse>()
+.Produces<ApiError>(400).Produces<ApiError>(503).Produces<ApiError>(500);
 
 app.MapPost("/address", async (AddressRequest request, AddressExtractor extractor,
     HttpContext context, ILogger<Program> logger) =>
@@ -127,6 +153,11 @@ app.MapPost("/address", async (AddressRequest request, AddressExtractor extracto
         logger.LogWarning(ex, "Invalid address model response");
         return Results.Json(new { error = "Address model returned invalid or incomplete JSON." }, statusCode: 502);
     }
-});
+})
+.WithName("ExtractAddress").WithTags("Address")
+.WithSummary("Extract the first address or intersection from text")
+.WithDescription("Send nonblank text of at most 2,000 characters. Missing address fields are null; if no address is found, all fields are null.")
+.Produces<AddressResponse>()
+.Produces<ApiError>(400).Produces<ApiError>(502).Produces<ApiError>(503).Produces<ApiError>(504);
 
 app.Run();

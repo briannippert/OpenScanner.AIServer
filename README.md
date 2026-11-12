@@ -111,6 +111,14 @@ journalctl -u openscanner-whisper -f    # View logs
 
 To run manually: `dotnet run --urls "http://0.0.0.0:8090"` (default dev port is 5000).
 
+## Swagger / API documentation
+
+Open `/swagger` on the running server (for example,
+`http://localhost:8090/swagger`) to explore and try all four endpoints, including
+WAV file uploads and JSON address requests. The OpenAPI document is available at
+`/swagger/v1/swagger.json`. Both are enabled in development and production, so
+Swagger is available when running the installed systemd service.
+
 ## API Endpoints
 
 ### GET /health

@@ -38,6 +38,7 @@ with socket.socket() as probe:
     app_port = probe.getsockname()[1]
 base_url = f'http://127.0.0.1:{app_port}'
 env=dict(os.environ, Address__OllamaUrl=f'http://127.0.0.1:{backend.server_port}',
+         ASPNETCORE_ENVIRONMENT='Production', DOTNET_ENVIRONMENT='Production',
          Address__TimeoutSeconds='1', Whisper__WhisperServerBinary='/nonexistent/test-whisper')
 with tempfile.TemporaryFile(mode='w+') as log:
     app=subprocess.Popen(['dotnet','bin/Debug/net10.0/OpenScanner.WhisperServer.dll','--urls',base_url],cwd=ROOT,env=env,stdout=log,stderr=log)
@@ -48,6 +49,24 @@ with tempfile.TemporaryFile(mode='w+') as log:
         else:
             log.seek(0)
             raise RuntimeError('Server failed to start: ' + log.read())
+        with urllib.request.urlopen(base_url + '/swagger/index.html') as response:
+            assert 'Swagger UI' in response.read().decode()
+        with urllib.request.urlopen(base_url + '/swagger/v1/swagger.json') as response:
+            spec = json.load(response)
+        assert set(spec['paths']) == {'/health', '/models', '/transcribe', '/address'}
+        upload = spec['paths']['/transcribe']['post']['requestBody']['content']['multipart/form-data']['schema']
+        assert upload['required'] == ['file']
+        assert upload['properties']['file']['format'] == 'binary'
+        assert set(upload['properties']) == {'file', 'model', 'prompt'}
+        address = spec['paths']['/address']['post']
+        assert 'application/json' in address['requestBody']['content']
+        assert set(address['responses']) >= {'200', '400', '502', '503', '504'}
+        schema_ref = address['responses']['200']['content']['application/json']['schema']['$ref']
+        assert set(spec['components']['schemas'][schema_ref.split('/')[-1]]['properties']) == set(fields)
+        for path in ['/health', '/models', '/transcribe']:
+            operation = next(iter(spec['paths'][path].values()))
+            assert operation['responses']['200']['content']['application/json']['schema']
+        print('PASS: Swagger UI and OpenAPI routes, upload fields, and response schemas in Production')
         def request(payload):
             req=urllib.request.Request(base_url + '/address',data=json.dumps(payload).encode(),headers={'Content-Type':'application/json'})
             try:
