@@ -1,4 +1,5 @@
 using Microsoft.OpenApi;
+using OpenScanner.WhisperServer.Services;
 using Swashbuckle.AspNetCore.SwaggerGen;
 
 namespace OpenScanner.WhisperServer.Api;
@@ -11,7 +12,8 @@ public sealed record HealthResponse(string Status, string DefaultModel, bool Bin
     bool DefaultModelFound, IReadOnlyList<string> LoadedModels, string Acceleration,
     string Cpu, string? Gpu, int? GpuMemoryMb);
 public sealed record AddressResponse(string? Address, string? HouseNumber, string? Street,
-    string? Unit, string? City, string? State, string? PostalCode, string? Country, string? CrossStreet);
+    string? Unit, string? City, string? State, string? PostalCode, string? Country, string? CrossStreet,
+    GeocodeMatch? Geocode, string? PlaceName);
 
 // The transcription handler reads the multipart form manually, so ApiExplorer
 // cannot infer its upload fields from the handler parameters.

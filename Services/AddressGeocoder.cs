@@ -5,7 +5,10 @@ using Microsoft.Extensions.Caching.Memory;
 namespace OpenScanner.WhisperServer.Services;
 
 public sealed record GeocodeRequest(string? Address, string? Context = null);
-public sealed record GeocodeMatch(string MatchedAddress, double Latitude, double Longitude);
+public sealed record GeocodeMatch(string MatchedAddress, double Latitude, double Longitude,
+    string? Name = null, string? HouseNumber = null, string? Street = null, string? City = null,
+    string? State = null, string? PostalCode = null, string? Country = null,
+    string? Attribution = null);
 public sealed record GeocodeResponse(bool Found, IReadOnlyList<GeocodeMatch> Matches,
     string Provider = "US Census Bureau", int? SelectedMatchIndex = null,
     string SelectionStatus = "no_match")

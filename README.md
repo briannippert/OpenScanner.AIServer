@@ -186,9 +186,10 @@ Re-run the installer to pull the latest code, rebuild, and restart:
 
 MIT
 
-## Address extraction (local LLM)
+## Address extraction and automatic location lookup
 
-`POST /address` accepts JSON text and returns a fixed JSON object. It uses a separately
+`POST /address` accepts JSON text, extracts a location, and automatically resolves
+its address and coordinates when possible. Extraction uses a separately
 running local [Ollama](https://ollama.com/) service; the Whisper installer does not
 install Ollama or download the LLM. After installing and starting Ollama on the server:
 
@@ -218,15 +219,34 @@ Example response (actual extraction depends on the model):
   "state": null,
   "postalCode": null,
   "country": null,
-  "crossStreet": null
+  "crossStreet": null,
+  "placeName": null,
+  "geocode": null
 }
 ```
 
 The first address is extracted if several are mentioned. Intersections use `street`
 and `crossStreet`; partial addresses are supported. Missing fields are null, and
-no address produces an object with every field null. This extracts text, rather
-than validating a real location or geocoding it. Check accuracy against your own
-radio transcripts before relying on the results.
+no location produces an object with every field null, without making an external lookup.
+`placeName` contains an extracted business or landmark name. `geocode` contains the
+selected provider match (including `matchedAddress`, numeric `latitude` and
+`longitude`) or null when no match can be selected. Geocoding outages, invalid
+responses, timeouts, and ambiguous results do not discard the extracted address:
+`/address` still returns HTTP 200 with `geocode: null`.
+
+For street addresses, the server calls Census automatically. For business names,
+it checks the configured local directory, then Photon/OpenStreetMap. The original
+text is supplied only to the local LLM for candidate selection. Only the extracted
+address/name and locality are sent externally. A successful business match fills
+the address fields from the provider/directory, never from the LLM's memory.
+
+The configured default area is Salem, NH (`Geocoding:DefaultCity` and
+`Geocoding:DefaultState`). Missing locality is added to lookup queries; explicit
+extracted locality takes precedence. The extraction prompt distinguishes Route 28,
+radio unit IDs and Massachusetts license plates from house numbers and location
+states. Model behavior still needs evaluation against actual radio transcripts.
+Automatic lookup can add the geocoding timeout and a second LLM call to latency.
+Extracted queries over 500 characters are preserved but not sent for lookup.
 
 Input must contain nonblank `text` of at most 2,000 characters (400 otherwise).
 Backend failures return 503, invalid/incomplete model output returns 502, and a
@@ -274,8 +294,9 @@ the server without pulling main, use `./scripts/install_service.sh --skip-update
 
 `POST /geocode` uses the free [US Census geocoder](https://geocoding.geo.census.gov/geocoder/Geocoding_Services_API.html)
 with no API key or GPU required. It sends only the supplied address to the external
-provider. `/address` remains local: pass its extracted `address` to `/geocode`
-when coordinates are needed, including known city/state or ZIP for disambiguation.
+provider. `/address` now calls the same geocoding/selection service automatically.
+Use `/geocode` for a standalone street-address lookup with optional context;
+include city/state or ZIP explicitly on this standalone endpoint.
 
 ```bash
 curl http://localhost:8090/geocode \
@@ -329,7 +350,7 @@ Ollama service and is not sent to Census. Ranking uses the same model and infere
 queue as `/address`, with the configured address-model timeout. It does not load
 a second LLM. Cached geocoding candidates are ranked afresh for each context.
 
- Census estimates points along street
+Census estimates points along street
 address ranges; these are not guaranteed rooftop positions. Numbered street
 addresses are required by the provider; bare intersections, landmarks, and incomplete
 transcripts may not resolve. This endpoint does not supply map tiles.
@@ -346,3 +367,59 @@ the cache. Errors are not cached or automatically retried.
 the Census-compatible backend, dataset (default `Public_AR_Current`), and total
 queue/request timeout (default 30 seconds). Environment overrides use double
 underscores, for example `Geocoding__TimeoutSeconds=60`.
+
+
+### Business names and local radio aliases
+
+For example, submit the actual transcript to `/address`:
+
+```json
+{"text":"117, copy, stop. Go ahead. 28, Dollar Tree, Mass, 4, Paul, Henry, Edward, 93. Copy."}
+```
+
+A successful lookup returns `placeName: "Dollar Tree"`, the resolved street address,
+and a `geocode` object. The repository includes an entry for 294 N Broadway,
+Salem, NH 03079, verified against [Dollar Tree's store locator](https://locations.dollartree.com/nh/salem/294-n-broadway-suite-4).
+The store is Suite 4; Census resolves the street address rather than a suite entrance.
+Census returned latitude `42.7971735138`, longitude `-71.238059822759` during a
+live verification. Coordinates are fetched at runtime rather than hard-coded.
+
+Maintain `Geocoding:Places` for known local businesses and confirmed radio aliases:
+
+```json
+{
+  "Name": "Example Business",
+  "Aliases": ["confirmed radio nickname"],
+  "Address": "123 Main Street, Salem, NH 03079",
+  "HouseNumber": "123",
+  "Street": "Main Street",
+  "City": "Salem",
+  "State": "NH",
+  "PostalCode": "03079",
+  "Source": "https://example.com/location"
+}
+```
+
+This is a configuration example, not an actual verified business. Entries match
+names/aliases exactly ignoring case and require matching city/state. Their street
+addresses are geocoded with Census. Do not add speculative aliases for uncertain
+transcripts such as “tailwind chasers” until the intended place is confirmed.
+
+Names absent from the directory use [Photon](https://github.com/komoot/photon).
+Results must match the requested town, state and US country code; even one fuzzy
+candidate is checked by the LLM against the business name and transcript before
+selection. Missing locality metadata is rejected rather than guessing. NH and
+New Hampshire are treated as equivalent. Coverage is incomplete: the live Photon
+query for Dollar Tree returned other NH towns, which is why the verified local
+entry is useful. An unknown or uncertain name can remain unresolved.
+
+`Geocoding:PlaceEndpoint` defaults to `https://photon.komoot.io/api/` and can point
+to another Photon-compatible instance. The public demo permits reasonable use,
+may throttle requests, and has no availability guarantee; use a private instance
+for sustained/high-volume operation. The server caches up to 1,000 place queries
+for 24 hours and spaces uncached calls at least one second apart per process.
+Display the returned `geocode.attribution` with OpenStreetMap-derived results
+([OpenStreetMap copyright](https://www.openstreetmap.org/copyright)). Local-directory
+matches include their source URL in that field. No API key or additional GPU model
+is required. The LLM is only used to extract names/select candidates, not to invent
+coordinates or repair uncertain business names from memory.

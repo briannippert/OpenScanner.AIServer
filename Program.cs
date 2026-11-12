@@ -25,6 +25,8 @@ builder.Services.AddHttpClient("geocoding", client =>
     client.DefaultRequestHeaders.UserAgent.ParseAdd("OpenScanner.WhisperServer/1.0");
 }).RemoveAllLoggers();
 builder.Services.AddSingleton<AddressGeocoder>();
+builder.Services.AddSingleton<GeocodeResolver>();
+builder.Services.AddSingleton<PlaceGeocoder>();
 // Non-logging client for internal loopback calls to whisper-server: the health
 // poll during model startup would otherwise flood the log with expected
 // connection-refused messages while the child boots.
@@ -136,14 +138,56 @@ app.MapPost("/transcribe", async (HttpRequest request, WhisperServerPool pool, I
 .Produces<TranscriptionResponse>()
 .Produces<ApiError>(400).Produces<ApiError>(503).Produces<ApiError>(500);
 
-app.MapPost("/address", async (AddressRequest request, AddressExtractor extractor,
+app.MapPost("/address", async (AddressRequest request, AddressExtractor extractor, GeocodeResolver resolver, PlaceGeocoder places,
     HttpContext context, ILogger<Program> logger) =>
 {
     if (string.IsNullOrWhiteSpace(request.Text) || request.Text.Length > extractor.MaxTextLength)
         return Results.Json(new { error = $"Text is required and must be at most {extractor.MaxTextLength} characters." }, statusCode: 400);
     try
     {
-        return Results.Ok(await extractor.ExtractAsync(request.Text, context.RequestAborted));
+        var fields = await extractor.ExtractAsync(request.Text, context.RequestAborted);
+        GeocodeMatch? geocode = null;
+        var address = fields["address"];
+        var placeName = fields["placeName"];
+        if ((!string.IsNullOrWhiteSpace(address) && address.Length <= 500) ||
+            (!string.IsNullOrWhiteSpace(placeName) && placeName.Length <= 500))
+        {
+            try
+            {
+                GeocodeResponse resolved;
+                if (!string.IsNullOrWhiteSpace(placeName) && placeName.Length <= 500)
+                    resolved = await resolver.ResolvePlaceAsync(placeName, fields["city"], fields["state"],
+                        request.Text, context.RequestAborted);
+                else
+                {
+                    var query = string.Join(", ", new[] { address,
+                        string.IsNullOrWhiteSpace(fields["city"]) ? places.DefaultCity : null,
+                        string.IsNullOrWhiteSpace(fields["state"]) ? places.DefaultState : null }
+                        .Where(v => !string.IsNullOrWhiteSpace(v)));
+                    resolved = await resolver.ResolveAsync(query, request.Text, context.RequestAborted);
+                }
+                geocode = resolved.SelectedMatch;
+                if (geocode is not null && !string.IsNullOrWhiteSpace(placeName))
+                {
+                    fields["address"] = geocode.MatchedAddress;
+                    fields["houseNumber"] = geocode.HouseNumber ?? fields["houseNumber"];
+                    fields["street"] = geocode.Street ?? fields["street"];
+                    fields["city"] = geocode.City ?? fields["city"];
+                    fields["state"] = geocode.State ?? fields["state"];
+                    fields["postalCode"] = geocode.PostalCode ?? fields["postalCode"];
+                    fields["country"] = geocode.Country ?? fields["country"];
+                }
+            }
+            catch (Exception ex) when (ex is HttpRequestException or System.Text.Json.JsonException ||
+                (ex is OperationCanceledException && !context.RequestAborted.IsCancellationRequested))
+            {
+                // Optional enrichment must not discard a successful extraction.
+                logger.LogWarning("Automatic geocoding could not resolve the extracted address ({FailureType})", ex.GetType().Name);
+            }
+        }
+        return Results.Ok(new AddressResponse(fields["address"], fields["houseNumber"], fields["street"],
+            fields["unit"], fields["city"], fields["state"], fields["postalCode"], fields["country"],
+            fields["crossStreet"], geocode, placeName));
     }
     catch (OperationCanceledException) when (!context.RequestAborted.IsCancellationRequested)
     {
@@ -161,13 +205,13 @@ app.MapPost("/address", async (AddressRequest request, AddressExtractor extracto
     }
 })
 .WithName("ExtractAddress").WithTags("Address")
-.WithSummary("Extract the first address or intersection from text")
-.WithDescription("Send nonblank text of at most 2,000 characters. Missing address fields are null; if no address is found, all fields are null.")
+.WithSummary("Extract and locate an address, business, or landmark from text")
+.WithDescription("Send nonblank text of at most 2,000 characters. Missing address fields are null; if no address is found, all fields are null. Extracts business names into placeName. Automatically geocodes street addresses through Census and businesses through a local directory or Photon, using the configured default area (Salem, NH) and uses the original text locally to resolve ambiguous candidates. The geocode field contains the selected coordinates, or null if unresolved or unavailable.")
 .Produces<AddressResponse>()
 .Produces<ApiError>(400).Produces<ApiError>(502).Produces<ApiError>(503).Produces<ApiError>(504);
 
-app.MapPost("/geocode", async (GeocodeRequest request, AddressGeocoder geocoder,
-    AddressExtractor extractor, HttpContext context) =>
+app.MapPost("/geocode", async (GeocodeRequest request, GeocodeResolver resolver,
+    HttpContext context) =>
 {
     if (string.IsNullOrWhiteSpace(request.Address) || request.Address.Length > 500)
         return Results.BadRequest(new ApiError("Address is required and must be at most 500 characters."));
@@ -175,23 +219,7 @@ app.MapPost("/geocode", async (GeocodeRequest request, AddressGeocoder geocoder,
         return Results.BadRequest(new ApiError("Context must be at most 2,000 characters."));
     try
     {
-        var result = await geocoder.GeocodeAsync(request.Address, context.RequestAborted);
-        if (result.Matches.Count > 1)
-        {
-            try
-            {
-                var selected = await extractor.SelectMatchAsync(request.Address, request.Context,
-                    result.Matches, context.RequestAborted);
-                result = result with { SelectedMatchIndex = selected,
-                    SelectionStatus = selected.HasValue ? "llm_selected" : "ambiguous" };
-            }
-            catch (Exception ex) when (ex is HttpRequestException or System.Text.Json.JsonException ||
-                (ex is OperationCanceledException && !context.RequestAborted.IsCancellationRequested))
-            {
-                // Geocoding succeeded; retain candidates even if local ranking failed.
-                result = result with { SelectionStatus = "llm_unavailable" };
-            }
-        }
+        var result = await resolver.ResolveAsync(request.Address, request.Context, context.RequestAborted);
         return Results.Ok(result);
     }
     catch (OperationCanceledException) when (!context.RequestAborted.IsCancellationRequested)
