@@ -1,0 +1,238 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Transmission response",
+  "oneOf": [
+    {
+      "type": "object",
+      "maxProperties": 0
+    },
+    {
+      "type": "object",
+      "properties": {
+        "callType": {
+          "type": "string",
+          "enum": [
+            "traffic_stop",
+            "traffic_collision",
+            "fire",
+            "medical",
+            "rescue",
+            "alarm",
+            "assault",
+            "domestic_disturbance",
+            "theft",
+            "burglary",
+            "suspicious_activity",
+            "welfare_check",
+            "disturbance",
+            "hazard",
+            "public_assistance",
+            "other"
+          ]
+        },
+        "service": {
+          "enum": [
+            "police",
+            "fire",
+            null
+          ]
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 1
+        },
+        "incidentStatus": {
+          "enum": [
+            "dispatched",
+            "en_route",
+            "on_scene",
+            "cleared",
+            null
+          ]
+        },
+        "location": {
+          "$ref": "#/$defs/location"
+        }
+      },
+      "required": [
+        "callType",
+        "service",
+        "summary",
+        "incidentStatus",
+        "location"
+      ],
+      "additionalProperties": false
+    }
+  ],
+  "$defs": {
+    "location": {
+      "type": "object",
+      "properties": {
+        "placeName": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "address": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "houseNumber": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "street": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "unit": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "city": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "state": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "postalCode": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "country": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "crossStreet": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "geocode": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/geocode"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "placeName",
+        "address",
+        "houseNumber",
+        "street",
+        "unit",
+        "city",
+        "state",
+        "postalCode",
+        "country",
+        "crossStreet",
+        "geocode"
+      ],
+      "additionalProperties": false
+    },
+    "geocode": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "houseNumber": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "street": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "city": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "state": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "postalCode": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "country": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "attribution": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "matchedAddress": {
+          "type": "string"
+        },
+        "latitude": {
+          "type": "number",
+          "minimum": -90,
+          "maximum": 90
+        },
+        "longitude": {
+          "type": "number",
+          "minimum": -180,
+          "maximum": 180
+        }
+      },
+      "required": [
+        "name",
+        "houseNumber",
+        "street",
+        "city",
+        "state",
+        "postalCode",
+        "country",
+        "attribution",
+        "matchedAddress",
+        "latitude",
+        "longitude"
+      ],
+      "additionalProperties": false
+    }
+  }
+}

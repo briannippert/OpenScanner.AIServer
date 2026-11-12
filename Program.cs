@@ -15,10 +15,13 @@ builder.Services.AddSwaggerGen(options =>
     });
     options.SupportNonNullableReferenceTypes();
     options.OperationFilter<TranscriptionOperationFilter>();
+    options.OperationFilter<TransmissionOperationFilter>();
 });
 builder.Services.AddHttpClient();
 builder.Services.AddHttpClient("address", client => client.Timeout = Timeout.InfiniteTimeSpan);
 builder.Services.AddSingleton<AddressExtractor>();
+builder.Services.AddSingleton<TransmissionAnalyzer>();
+builder.Services.AddSingleton<LocationEnricher>();
 builder.Services.AddHttpClient("geocoding", client =>
 {
     client.Timeout = Timeout.InfiniteTimeSpan;
@@ -27,6 +30,7 @@ builder.Services.AddHttpClient("geocoding", client =>
 builder.Services.AddSingleton<AddressGeocoder>();
 builder.Services.AddSingleton<GeocodeResolver>();
 builder.Services.AddSingleton<PlaceGeocoder>();
+builder.Services.AddSingleton<StreetGeocoder>();
 // Non-logging client for internal loopback calls to whisper-server: the health
 // poll during model startup would otherwise flood the log with expected
 // connection-refused messages while the child boots.
@@ -79,7 +83,7 @@ app.MapGet("/models", (WhisperServerPool pool) =>
 .WithSummary("List installed Whisper models")
 .Produces<ModelsResponse>();
 
-app.MapPost("/transcribe", async (HttpRequest request, WhisperServerPool pool, ILogger<Program> logger) =>
+app.MapPost("/transcribe", async (HttpRequest request, WhisperServerPool pool, TransmissionAnalyzer analyzer, AddressExtractor extractor, ILogger<Program> logger) =>
 {
     if (!pool.IsReady())
     {
@@ -103,6 +107,18 @@ app.MapPost("/transcribe", async (HttpRequest request, WhisperServerPool pool, I
     var prompt = form.TryGetValue("prompt", out var promptValues) ? promptValues.ToString() : null;
     var model = form.TryGetValue("model", out var modelValues) ? modelValues.ToString() : null;
 
+    var includeMetadata = false;
+    if (form.TryGetValue("includeMetadata", out var metadataValue) &&
+        !bool.TryParse(metadataValue.ToString(), out includeMetadata))
+        return Results.BadRequest(new ApiError("includeMetadata must be true or false."));
+    var service = LocationDefaults.Normalize(form["service"].ToString())?.ToLowerInvariant();
+    if (service is not (null or "police" or "fire"))
+        return Results.BadRequest(new ApiError("Service must be police or fire when supplied."));
+    var defaultCity = LocationDefaults.Normalize(form["defaultCity"].ToString());
+    var defaultState = LocationDefaults.Normalize(form["defaultState"].ToString());
+    if (!LocationDefaults.Valid(defaultCity, defaultState))
+        return Results.BadRequest(new ApiError(LocationDefaults.Error));
+
     // Save uploaded file to temp location (expected: 16 kHz mono WAV from OpenScanner).
     var tempDir = Path.Combine(Path.GetTempPath(), "whisper-server");
     Directory.CreateDirectory(tempDir);
@@ -121,7 +137,31 @@ app.MapPost("/transcribe", async (HttpRequest request, WhisperServerPool pool, I
             file.FileName, file.Length, string.IsNullOrWhiteSpace(model) ? pool.DefaultModel : model);
 
         var text = await pool.TranscribeAsync(tempPath, model, prompt, request.HttpContext.RequestAborted);
-        return Results.Ok(new { text = text ?? "" });
+        text ??= "";
+        if (!includeMetadata) return Results.Ok(new TranscriptionResponse(text));
+        if (text.Length > extractor.MaxTextLength)
+            return Results.Ok(new TranscriptionWithMetadataResponse(text, null,
+                "Transcript exceeds the 2000-character metadata limit."));
+        if (string.IsNullOrWhiteSpace(text))
+            return Results.Ok(new TranscriptionWithMetadataResponse(text, new EmptyTransmissionResponse(), null));
+        try
+        {
+            object metadata = (object?)await analyzer.AnalyzeAsync(text, service, defaultCity, defaultState,
+                request.HttpContext.RequestAborted) ?? new EmptyTransmissionResponse();
+            return Results.Ok(new TranscriptionWithMetadataResponse(text, metadata, null));
+        }
+        catch (Exception ex) when (ex is HttpRequestException or System.Text.Json.JsonException ||
+            ex is OperationCanceledException && !request.HttpContext.RequestAborted.IsCancellationRequested)
+        {
+            logger.LogWarning(ex, "Optional transcription metadata failed");
+            var error = ex switch
+            {
+                OperationCanceledException => "Metadata extraction timed out.",
+                HttpRequestException => "Metadata model unavailable.",
+                _ => "Metadata model returned invalid or incomplete JSON."
+            };
+            return Results.Ok(new TranscriptionWithMetadataResponse(text, null, error));
+        }
     }
     catch (Exception ex)
     {
@@ -134,60 +174,22 @@ app.MapPost("/transcribe", async (HttpRequest request, WhisperServerPool pool, I
     }
 })
 .WithName("Transcribe").WithTags("Transcription")
-.WithSummary("Transcribe a WAV audio upload")
+.WithSummary("Transcribe a WAV audio upload with optional incident metadata")
+.WithDescription("Set includeMetadata=true for metadata and location lookup. Optional service is police/fire. defaultCity/defaultState provide request-scoped locality hints; spoken locality takes precedence. The default response remains {text}. Metadata failures preserve the text and return metadata:null with metadataError.")
 .Produces<TranscriptionResponse>()
 .Produces<ApiError>(400).Produces<ApiError>(503).Produces<ApiError>(500);
 
-app.MapPost("/address", async (AddressRequest request, AddressExtractor extractor, GeocodeResolver resolver, PlaceGeocoder places,
+app.MapPost("/address", async (AddressRequest request, AddressExtractor extractor, LocationEnricher locations,
     HttpContext context, ILogger<Program> logger) =>
 {
     if (string.IsNullOrWhiteSpace(request.Text) || request.Text.Length > extractor.MaxTextLength)
         return Results.Json(new { error = $"Text is required and must be at most {extractor.MaxTextLength} characters." }, statusCode: 400);
+    if (!LocationDefaults.Valid(request.DefaultCity, request.DefaultState))
+        return Results.BadRequest(new ApiError(LocationDefaults.Error));
     try
     {
         var fields = await extractor.ExtractAsync(request.Text, context.RequestAborted);
-        GeocodeMatch? geocode = null;
-        var address = fields["address"];
-        var placeName = fields["placeName"];
-        if ((!string.IsNullOrWhiteSpace(address) && address.Length <= 500) ||
-            (!string.IsNullOrWhiteSpace(placeName) && placeName.Length <= 500))
-        {
-            try
-            {
-                GeocodeResponse resolved;
-                if (!string.IsNullOrWhiteSpace(placeName) && placeName.Length <= 500)
-                    resolved = await resolver.ResolvePlaceAsync(placeName, fields["city"], fields["state"],
-                        request.Text, context.RequestAborted);
-                else
-                {
-                    var query = string.Join(", ", new[] { address,
-                        string.IsNullOrWhiteSpace(fields["city"]) ? places.DefaultCity : null,
-                        string.IsNullOrWhiteSpace(fields["state"]) ? places.DefaultState : null }
-                        .Where(v => !string.IsNullOrWhiteSpace(v)));
-                    resolved = await resolver.ResolveAsync(query, request.Text, context.RequestAborted);
-                }
-                geocode = resolved.SelectedMatch;
-                if (geocode is not null && !string.IsNullOrWhiteSpace(placeName))
-                {
-                    fields["address"] = geocode.MatchedAddress;
-                    fields["houseNumber"] = geocode.HouseNumber ?? fields["houseNumber"];
-                    fields["street"] = geocode.Street ?? fields["street"];
-                    fields["city"] = geocode.City ?? fields["city"];
-                    fields["state"] = geocode.State ?? fields["state"];
-                    fields["postalCode"] = geocode.PostalCode ?? fields["postalCode"];
-                    fields["country"] = geocode.Country ?? fields["country"];
-                }
-            }
-            catch (Exception ex) when (ex is HttpRequestException or System.Text.Json.JsonException ||
-                (ex is OperationCanceledException && !context.RequestAborted.IsCancellationRequested))
-            {
-                // Optional enrichment must not discard a successful extraction.
-                logger.LogWarning("Automatic geocoding could not resolve the extracted address ({FailureType})", ex.GetType().Name);
-            }
-        }
-        return Results.Ok(new AddressResponse(fields["address"], fields["houseNumber"], fields["street"],
-            fields["unit"], fields["city"], fields["state"], fields["postalCode"], fields["country"],
-            fields["crossStreet"], geocode, placeName));
+        return Results.Ok(await locations.EnrichAsync(fields, request.Text, context.RequestAborted, request.DefaultCity, request.DefaultState));
     }
     catch (OperationCanceledException) when (!context.RequestAborted.IsCancellationRequested)
     {
@@ -206,8 +208,45 @@ app.MapPost("/address", async (AddressRequest request, AddressExtractor extracto
 })
 .WithName("ExtractAddress").WithTags("Address")
 .WithSummary("Extract and locate an address, business, or landmark from text")
-.WithDescription("Send nonblank text of at most 2,000 characters. Missing address fields are null; if no address is found, all fields are null. Extracts business names into placeName. Automatically geocodes street addresses through Census and businesses through a local directory or Photon, using the configured default area (Salem, NH) and uses the original text locally to resolve ambiguous candidates. The geocode field contains the selected coordinates, or null if unresolved or unavailable.")
+.WithDescription("Send nonblank text of at most 2,000 characters. Missing address fields are null; if no address is found, all fields are null. Extracts business names into placeName. Automatically geocodes street addresses through Census and businesses through a local directory or Photon, using request defaultCity/defaultState or the configured default area and uses the original text locally to resolve ambiguous candidates. The geocode field contains the selected coordinates, or null if unresolved or unavailable.")
 .Produces<AddressResponse>()
+.Produces<ApiError>(400).Produces<ApiError>(502).Produces<ApiError>(503).Produces<ApiError>(504);
+
+app.MapPost("/transmission", async (TransmissionRequest request, AddressExtractor extractor,
+    TransmissionAnalyzer analyzer, HttpContext context, ILogger<Program> logger) =>
+{
+    if (string.IsNullOrWhiteSpace(request.Text) || request.Text.Length > extractor.MaxTextLength)
+        return Results.BadRequest(new ApiError("Text is required and must be at most 2000 characters."));
+    var service = request.Service?.Trim().ToLowerInvariant();
+    if (service is not (null or "police" or "fire"))
+        return Results.BadRequest(new ApiError("Service must be police or fire when supplied."));
+    if (!LocationDefaults.Valid(request.DefaultCity, request.DefaultState))
+        return Results.BadRequest(new ApiError(LocationDefaults.Error));
+    try
+    {
+        var result = await analyzer.AnalyzeAsync(request.Text, service, request.DefaultCity,
+            request.DefaultState, context.RequestAborted);
+        return result is null ? Results.Ok(new EmptyTransmissionResponse()) : Results.Ok(result);
+    }
+    catch (OperationCanceledException) when (!context.RequestAborted.IsCancellationRequested)
+    {
+        return Results.Json(new ApiError("Transmission extraction timed out."), statusCode: 504);
+    }
+    catch (HttpRequestException ex)
+    {
+        logger.LogWarning(ex, "Transmission model unavailable");
+        return Results.Json(new ApiError("Transmission model unavailable. Check Ollama and the configured model."), statusCode: 503);
+    }
+    catch (System.Text.Json.JsonException ex)
+    {
+        logger.LogWarning(ex, "Invalid transmission model response");
+        return Results.Json(new ApiError("Transmission model returned invalid or incomplete JSON."), statusCode: 502);
+    }
+})
+.WithName("ExtractTransmission").WithTags("Transmission")
+.WithSummary("Extract incident metadata and location from a radio transmission")
+.WithDescription("Returns {} for routine chatter. Substantive transmissions return callType, service, summary, incidentStatus and location (the existing address and geocode fields). Optional service input is police or fire and overrides inference. defaultCity/defaultState override configured lookup defaults; spoken locality takes precedence. Unmatched street addresses may use a locality-filtered Photon street search, cross-street proximity checks, and Census revalidation; extracted text is preserved. No incident tracking or grouping is performed. Call types: " + string.Join(", ", AddressExtractor.CallTypes))
+.Produces<TransmissionResponse>()
 .Produces<ApiError>(400).Produces<ApiError>(502).Produces<ApiError>(503).Produces<ApiError>(504);
 
 app.MapPost("/geocode", async (GeocodeRequest request, GeocodeResolver resolver,

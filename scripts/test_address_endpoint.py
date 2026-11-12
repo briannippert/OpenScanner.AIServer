@@ -13,9 +13,13 @@ place_calls = []
 class Backend(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         query = parse_qs(urlparse(self.path).query)
+        if urlparse(self.path).path == '/streets':
+            self.send_response(200); self.send_header('Content-Type', 'application/json'); self.end_headers()
+            self.wfile.write(b'{"features": []}')
+            return
         if urlparse(self.path).path == '/places':
             query_text = query['q'][0]
-            assert query_text.endswith(', Salem, NH, USA')
+            assert query_text.endswith(', USA')
             place_calls.append(query_text)
             if query_text.startswith('offline'): self.send_error(503); return
             features = []
@@ -59,8 +63,31 @@ class Backend(http.server.BaseHTTPRequestHandler):
         assert self.path == '/api/chat' and data['think'] is False and data['stream'] is False
         assert data['options']['num_ctx']==4096
         ranking = data['format']['required'] == ['selectedMatchIndex']
-        if not ranking: assert data['format']['required']==fields
+        transmission = 'callType' in data['format']['required']
+        if not ranking and not transmission: assert data['format']['required']==fields
         text=data['messages'][-1]['content']
+        if transmission:
+            text = text.split('Transmission text:\n', 1)[1]
+            if text == 'unavailable': self.send_error(503); return
+            if text == 'timeout': time.sleep(2); return
+            result = dict.fromkeys(fields + ['callType', 'service', 'summary', 'incidentStatus'])
+            if text == 'traffic stop':
+                result.update(callType='traffic_stop', service='police', summary='Traffic stop at 123 Main St.',
+                              address='123 Main St', houseNumber='123', street='Main St')
+            if text == 'medical':
+                result.update(callType='medical', summary='Patient having trouble breathing.')
+            if text == 'default probe':
+                result.update(callType='other', summary='Incident at 124 Main St.', address='124 Main St',
+                              houseNumber='124', street='Main St')
+            if text == 'explicit locality':
+                result.update(callType='medical', summary='Medical call at 9 Pine St, Concord, NH.', address='9 Pine St',
+                              houseNumber='9', street='Pine St', city='Concord', state='NH')
+            if text.startswith('business '): result.update(callType='other', summary='Incident at a business.', placeName=text.removeprefix('business '))
+            if text == 'bad-category': result.update(callType='invented', summary='Test')
+            content = '{}' if text == 'invalid' else json.dumps(result)
+            self.send_response(200); self.send_header('Content-Type', 'application/json'); self.end_headers()
+            self.wfile.write(json.dumps({'done': True, 'message': {'content': content}}).encode())
+            return
         if ranking:
             selection = json.loads(text)
             context = selection['context']
@@ -95,11 +122,37 @@ with socket.socket() as probe:
     probe.bind(('127.0.0.1', 0))
     app_port = probe.getsockname()[1]
 base_url = f'http://127.0.0.1:{app_port}'
+assets = tempfile.TemporaryDirectory()
+fixture_dir = Path(assets.name)
+transcript_file = fixture_dir / 'transcript.txt'
+transcript_file.write_text('traffic stop')
+(fixture_dir / 'ggml-test.bin').write_bytes(b'fixture')
+whisper = fixture_dir / 'whisper-server'
+whisper.write_text('''#!/usr/bin/env python3
+import http.server, json, os, sys
+from pathlib import Path
+port = int(sys.argv[sys.argv.index('--port')+1])
+class Handler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *args): pass
+    def do_GET(self):
+        self.send_response(200); self.end_headers(); self.wfile.write(b'{"status":"ok"}')
+    def do_POST(self):
+        self.rfile.read(int(self.headers['Content-Length']))
+        self.send_response(200); self.send_header('Content-Type','application/json'); self.end_headers()
+        self.wfile.write(json.dumps({'text':Path(os.environ['MOCK_TRANSCRIPT_FILE']).read_text()}).encode())
+http.server.HTTPServer(('127.0.0.1',port),Handler).serve_forever()
+''')
+whisper.chmod(0o755)
+with socket.socket() as probe:
+    probe.bind(('127.0.0.1',0)); whisper_port = probe.getsockname()[1]
 env=dict(os.environ, Address__OllamaUrl=f'http://127.0.0.1:{backend.server_port}',
          ASPNETCORE_ENVIRONMENT='Production', DOTNET_ENVIRONMENT='Production',
          Geocoding__Endpoint=f'http://127.0.0.1:{backend.server_port}/geocoder', Geocoding__TimeoutSeconds='2',
          Geocoding__PlaceEndpoint=f'http://127.0.0.1:{backend.server_port}/places',
-         Address__TimeoutSeconds='1', Whisper__WhisperServerBinary='/nonexistent/test-whisper')
+         Geocoding__StreetEndpoint=f'http://127.0.0.1:{backend.server_port}/streets',
+         Address__TimeoutSeconds='1', Whisper__WhisperServerBinary=str(whisper),
+         Whisper__ModelsDir=str(fixture_dir), Whisper__DefaultModel='test', Whisper__BasePort=str(whisper_port),
+         Whisper__UseGpu='false', MOCK_TRANSCRIPT_FILE=str(transcript_file))
 with tempfile.TemporaryFile(mode='w+') as log:
     app=subprocess.Popen(['dotnet','bin/Debug/net10.0/OpenScanner.WhisperServer.dll','--urls',base_url],cwd=ROOT,env=env,stdout=log,stderr=log)
     try:
@@ -113,11 +166,16 @@ with tempfile.TemporaryFile(mode='w+') as log:
             assert 'Swagger UI' in response.read().decode()
         with urllib.request.urlopen(base_url + '/swagger/v1/swagger.json') as response:
             spec = json.load(response)
-        assert set(spec['paths']) == {'/health', '/models', '/transcribe', '/address', '/geocode'}
+        assert set(spec['paths']) == {'/health', '/models', '/transcribe', '/address', '/geocode', '/transmission'}
+        transmission_schema = spec['paths']['/transmission']['post']['responses']['200']['content']['application/json']['schema']
+        assert len(transmission_schema['oneOf']) == 2
+        assert transmission_schema['oneOf'][1]['maxProperties'] == 0
         upload = spec['paths']['/transcribe']['post']['requestBody']['content']['multipart/form-data']['schema']
         assert upload['required'] == ['file']
         assert upload['properties']['file']['format'] == 'binary'
-        assert set(upload['properties']) == {'file', 'model', 'prompt'}
+        assert set(upload['properties']) == {'file', 'model', 'prompt', 'includeMetadata', 'service', 'defaultCity', 'defaultState'}
+        assert upload['properties']['includeMetadata']['type'] == 'boolean'
+        assert len(spec['paths']['/transcribe']['post']['responses']['200']['content']['application/json']['schema']['oneOf']) == 2
         address = spec['paths']['/address']['post']
         assert 'application/json' in address['requestBody']['content']
         assert set(address['responses']) >= {'200', '400', '502', '503', '504'}
@@ -142,6 +200,67 @@ with tempfile.TemporaryFile(mode='w+') as log:
         assert status == 200 and value['geocode'] is None and len(geocode_calls) == count
         for text,status in [('invalid',502),('truncated',502),('unavailable',503),('timeout',504)]:
             assert request({'text':text})[0]==status, text
+        def transmission(text, service=None):
+            return request({'text': text, 'service': service}, '/transmission')
+        count = len(geocode_calls) + len(place_calls)
+        for text in ['copy', "I'm out", 'roger']:
+            assert transmission(text, 'police') == (200, {})
+        assert len(geocode_calls) + len(place_calls) == count
+        assert transmission('', 'fire')[0] == 400
+        assert transmission('test', 'ems')[0] == 400
+        status, value = transmission('traffic stop', ' FIRE ')
+        assert status == 200 and value['service'] == 'fire' and value['callType'] == 'traffic_stop'
+        assert value['location']['houseNumber'] == '123' and value['location']['geocode']['latitude'] == 38.9
+        status, value = transmission('medical')
+        assert status == 200 and value['callType'] == 'medical' and value['service'] is None
+        assert all(v is None for v in value['location'].values())
+        for text, expected in [('invalid', 502), ('bad-category', 502), ('unavailable', 503), ('timeout', 504)]:
+            assert transmission(text)[0] == expected
+        print('PASS: transmission metadata, service override, empty chatter, location enrichment, validation and failures')
+        # Per-request defaults apply to lookups only and never leak into another request.
+        for route, text in [('/transmission', 'traffic stop'), ('/address', '123 Main St')]:
+            for city in (['Derry', 'Windham'] if route == '/transmission' else ['Hudson', 'Londonderry']):
+                count = len(geocode_calls)
+                status, value = request({'text': text, 'defaultCity': city, 'defaultState': 'NH'}, route)
+                assert status == 200 and len(geocode_calls) == count + 1
+                assert geocode_calls[-1][0].endswith(', ' + city + ', NH')
+                assert (value['location'] if route == '/transmission' else value)['city'] is None
+        assert request({'text': 'default probe'}, '/transmission')[0] == 200
+        assert geocode_calls[-1][0] == '124 Main St, Salem, NH'
+        status, value = request({'text': 'explicit locality', 'defaultCity': 'Derry', 'defaultState': 'MA'}, '/transmission')
+        assert status == 200 and geocode_calls[-1][0] == '9 Pine St, Concord, NH'
+        assert value['location']['city'] == 'Concord'
+        status, value = request({'text': 'business Coffee Place', 'defaultCity': 'Concord', 'defaultState': 'NH'}, '/transmission')
+        assert status == 200 and value['location']['city'] == 'Concord'
+        for route in ['/address', '/transmission']:
+            assert request({'text': 'test', 'defaultCity': 'x'*101}, route)[0] == 400
+            assert request({'text': 'test', 'defaultState': 'NH, MA'}, route)[0] == 400
+        def transcribe(text, **options):
+            transcript_file.write_text(text)
+            boundary = 'openscanner-test-boundary'
+            parts = []
+            for name, value in options.items():
+                parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n')
+            parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="sample.wav"\r\nContent-Type: audio/wav\r\n\r\nfixture\r\n--{boundary}--\r\n')
+            req = urllib.request.Request(base_url+'/transcribe', data=''.join(parts).encode(),
+                headers={'Content-Type': 'multipart/form-data; boundary='+boundary})
+            try:
+                with urllib.request.urlopen(req, timeout=15) as response: return response.status, json.load(response)
+            except urllib.error.HTTPError as error: return error.code, json.load(error)
+        assert transcribe('traffic stop') == (200, {'text':'traffic stop'})
+        status, result = transcribe('traffic stop', includeMetadata='true', service='police', defaultCity='Pelham', defaultState='NH')
+        assert status == 200 and result['metadata']['callType'] == 'traffic_stop' and result['metadataError'] is None
+        assert geocode_calls[-1][0] == '123 Main St, Pelham, NH'
+        assert result['metadata']['location']['city'] is None
+        for text in ['copy', 'roger', '']:
+            assert transcribe(text, includeMetadata='true')[1] == {'text':text, 'metadata':{}, 'metadataError':None}
+        for text in ['unavailable', 'invalid', 'timeout', 'x'*2001]:
+            status, result = transcribe(text, includeMetadata='true')
+            assert status == 200 and result['text'] == text and result['metadata'] is None and result['metadataError']
+        assert transcribe('copy', includeMetadata='maybe')[0] == 400
+        assert transcribe('copy', service='ems')[0] == 400
+        assert transcribe('copy', defaultCity='x'*101)[0] == 400
+        print('PASS: request locality precedence/isolation, optional audio metadata, text preservation, validation and failures')
         def geocode(address, context=None):
             return request({'address': address, 'context': context}, '/geocode')
         for address in [None, '', ' ', 'x'*501]: assert geocode(address)[0] == 400
@@ -173,10 +292,11 @@ with tempfile.TemporaryFile(mode='w+') as log:
             status, value = request({'text': text})
             assert status == 200 and value['geocode'] is None and value['houseNumber'] == '123', text
         # A verified local entry resolves without using fuzzy place search.
+        directory_place_count = len(place_calls)
         status, value = request({'text': '117, copy, stop. Go ahead. 28, Dollar Tree, Mass, 4, Paul, Henry, Edward, 93. Copy.'})
         assert status == 200 and value['placeName'] == 'Dollar Tree' and value['houseNumber'] == '294'
         assert value['street'] == 'N Broadway' and value['city'] == 'Salem' and value['state'] == 'NH'
-        assert value['geocode'] is not None and not place_calls
+        assert value['geocode'] is not None and len(place_calls) == directory_place_count
         status, value = request({'text': 'business Coffee Place'})
         assert status == 200 and value['geocode']['latitude'] == 42.8
         assert value['address'] == '10 Main Street, Salem, New Hampshire, 03079'
@@ -196,4 +316,4 @@ with tempfile.TemporaryFile(mode='w+') as log:
         assert all(b[1] - a[1] >= .95 for a, b in zip(geocode_calls, geocode_calls[1:]))
         print('PASS: geocoding validation, encoding, coordinates, caching, throttling, failures, and LLM selection/fallback')
         print('PASS: 10 endpoint checks (validation, extraction, no address, invalid/truncated JSON, backend failure, timeout)')
-    finally: app.terminate(); app.wait(timeout=10); backend.shutdown(); backend.server_close()
+    finally: app.terminate(); app.wait(timeout=10); backend.shutdown(); backend.server_close(); assets.cleanup()

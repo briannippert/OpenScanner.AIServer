@@ -1,0 +1,157 @@
+[
+  {
+    "id": "log_1794437775285",
+    "callType": null,
+    "split": "development"
+  },
+  {
+    "id": "log_1794437645306",
+    "callType": null,
+    "split": "development"
+  },
+  {
+    "id": "log_1794437643258",
+    "callType": null,
+    "split": "development"
+  },
+  {
+    "id": "log_1794437489933",
+    "callType": null,
+    "split": "development"
+  },
+  {
+    "id": "log_1794436983658",
+    "callType": null,
+    "split": "development"
+  },
+  {
+    "id": "log_1794436079401",
+    "callType": null,
+    "split": "development"
+  },
+  {
+    "id": "log_1794432513624",
+    "callType": null,
+    "split": "development"
+  },
+  {
+    "id": "log_1794433441916",
+    "callType": null,
+    "split": "development"
+  },
+  {
+    "id": "log_1794431690607",
+    "callType": null,
+    "split": "development"
+  },
+  {
+    "id": "log_1794437603258",
+    "callType": "welfare_check",
+    "split": "development",
+    "location": {
+      "houseNumber": "500",
+      "unit": "503",
+      "placeName": null
+    }
+  },
+  {
+    "id": "log_1794436547982",
+    "callType": "traffic_collision",
+    "split": "development"
+  },
+  {
+    "id": "log_1794434822988",
+    "callType": "public_assistance",
+    "split": "development"
+  },
+  {
+    "id": "log_1794432355660",
+    "callType": "medical",
+    "split": "development"
+  },
+  {
+    "id": "log_1794432307600",
+    "callType": "medical",
+    "split": "development"
+  },
+  {
+    "id": "log_1794422586741",
+    "callType": "medical",
+    "split": "development"
+  },
+  {
+    "id": "log_1794422549061",
+    "callType": "medical",
+    "split": "development"
+  },
+  {
+    "id": "log_1794405272536",
+    "callType": "alarm",
+    "split": "development"
+  },
+  {
+    "id": "log_1794400741947",
+    "callType": "traffic_collision",
+    "split": "development"
+  },
+  {
+    "id": "log_1794371584869",
+    "callType": "alarm",
+    "split": "development"
+  },
+  {
+    "id": "log_1794368918222",
+    "callType": "alarm",
+    "split": "development"
+  },
+  {
+    "id": "log_1794368223545",
+    "callType": "alarm",
+    "split": "development"
+  },
+  {
+    "id": "log_1794336457285",
+    "callType": "public_assistance",
+    "split": "development"
+  },
+  {
+    "id": "log_1791161363632",
+    "callType": "domestic_disturbance",
+    "split": "holdout"
+  },
+  {
+    "id": "log_1790193738386",
+    "callType": "theft",
+    "split": "holdout"
+  },
+  {
+    "id": "log_1792044479575",
+    "callType": "suspicious_activity",
+    "split": "holdout"
+  },
+  {
+    "id": "log_1792782955828",
+    "callType": "welfare_check",
+    "split": "holdout"
+  },
+  {
+    "id": "log_1793730219708",
+    "callType": "traffic_collision",
+    "split": "holdout"
+  },
+  {
+    "id": "log_1793367146065",
+    "callType": "traffic_collision",
+    "split": "holdout"
+  },
+  {
+    "id": "log_1793202058456",
+    "callType": "medical",
+    "split": "holdout"
+  },
+  {
+    "id": "log_1792931906271",
+    "callType": "medical",
+    "split": "holdout"
+  }
+]

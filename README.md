@@ -186,6 +186,148 @@ Re-run the installer to pull the latest code, rebuild, and restart:
 
 MIT
 
+## User locality and optional metadata on audio uploads
+
+OpenScanner can pass the user's location settings as `defaultCity` and
+`defaultState`. Both are optional and apply only to the current lookup. Precedence:
+explicitly extracted city/state, then request defaults, then `Geocoding:DefaultCity`
+and `Geocoding:DefaultState`. Defaults do not become claimed spoken location fields.
+Blank defaults use server settings. Nonblank values are limited to 100 characters,
+without commas or control characters. These parameters are supported on `/address`
+and `/transmission` JSON requests and `/transcribe` multipart uploads.
+
+```bash
+curl http://localhost:8099/transcribe \
+  -F 'file=@dispatch.wav' \
+  -F 'includeMetadata=true' \
+  -F 'service=fire' \
+  -F 'defaultCity=Salem' \
+  -F 'defaultState=NH'
+```
+
+Without `includeMetadata=true`, `/transcribe` continues to return only `{ "text": "..." }`.
+With it enabled, the response has `text`, `metadata`, and `metadataError`.
+`metadata` contains the same object as `/transmission`, or `{}` for routine chatter
+or silence. Successful metadata extraction has `metadataError: null`. If extraction
+fails or the transcript exceeds 2,000 characters, the endpoint preserves the full
+transcript, returns HTTP 200 with `metadata: null`, and explains the failure in
+`metadataError`. Audio/transcription failures retain their existing error behavior.
+`service` is optional police/fire context; it does not change the audio decoding prompt.
+Metadata adds model and optional geocoding latency. Swagger shows all upload fields
+and both response modes.
+
+```json
+{
+  "text": "Engine 2 dispatched for a structure fire.",
+  "metadata": {
+    "callType": "fire",
+    "service": "fire",
+    "summary": "Engine 2 dispatched for a structure fire.",
+    "incidentStatus": "dispatched",
+    "location": {
+      "address": null, "houseNumber": null, "street": null, "unit": null,
+      "city": null, "state": null, "postalCode": null, "country": null,
+      "crossStreet": null, "placeName": null, "geocode": null
+    }
+  },
+  "metadataError": null
+}
+```
+
+## Transmission metadata
+
+`POST /transmission` parses one transmission into incident metadata and location.
+It uses the same local Ollama model, serialized inference queue, and optional
+geocoding as `/address`. The existing `/address` contract is unchanged.
+
+```bash
+curl http://localhost:8099/transmission \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"207, Ill stop. 207. 42, Kelly Road, Mass, 3, Victor, Yankee Yankee, 6-2. Copy.","service":"police","defaultCity":"Salem","defaultState":"NH"}'
+```
+
+Example (coordinates omitted here):
+
+```json
+{
+  "callType": "traffic_stop",
+  "service": "police",
+  "summary": "Traffic stop at 42 Kelly Road.",
+  "incidentStatus": null,
+  "location": {
+    "address": "42 Kelly Road",
+    "houseNumber": "42",
+    "street": "Kelly Road",
+    "unit": null,
+    "city": null,
+    "state": null,
+    "postalCode": null,
+    "country": null,
+    "crossStreet": null,
+    "placeName": null,
+    "geocode": null
+  }
+}
+```
+
+Routine chatter such as “copy”, “I'm out”, and “roger” returns HTTP 200 with `{}`,
+even with a supplied service. No geocoder is called for an empty result. Substantive
+calls can have metadata without a location (for example, a medical complaint).
+Missing fields are null. The input `service` is optional (`police` or `fire`,
+case insensitive); when supplied it overrides inference. Otherwise service is
+inferred only when clear, or null. The model classifies the first incident mentioned.
+
+Stable call types for filters: `traffic_stop`, `traffic_collision`, `fire`, `medical`,
+`rescue`, `alarm`, `assault`, `domestic_disturbance`, `theft`, `burglary`,
+`suspicious_activity`, `welfare_check`, `disturbance`, `hazard`, `public_assistance`,
+`other`. `other` represents substantive incident information with an unknown type.
+`incidentStatus` is `dispatched`, `en_route`, `on_scene`, `cleared`, or null, based
+on explicit statements. Classification and summaries are model interpretations.
+
+Machine-readable JSON Schemas are in
+[schemas/transmission-request.schema.json](schemas/transmission-request.schema.json)
+and [schemas/transmission-response.schema.json](schemas/transmission-response.schema.json).
+Swagger documents both the metadata object and empty response.
+Text must be nonblank and at most 2,000 characters. Invalid input returns 400;
+model unavailable, malformed output, and inference timeout return 503, 502, and 504.
+Geocoding failures preserve metadata with `location.geocode: null`.
+
+For a map, use `location.geocode.latitude` and `longitude`, then filter on `callType`
+and `service`. Coordinates may use the configured default locality when the
+transmission omits it. This endpoint does not create incident IDs, persist events,
+or link successive transmissions. OpenScanner should attach feed ID and received
+UTC timestamp and group related transmissions into incidents separately; an update
+alone may not identify its original call type or location.
+
+Verification: `dotnet build` then `python3 scripts/test_address_endpoint.py` exercises
+mocked backend contracts and failure paths. With real Ollama and a running server,
+run `python3 scripts/test_transmission_live.py http://127.0.0.1:8099` to check actual
+chatter filtering, traffic-stop parsing, fire dispatch, and location-free medical calls.
+
+For a downloaded OpenScanner support package, extract `openscanner_backup.db` to
+an investigation directory and evaluate the manually labeled real-transmission sample:
+
+```bash
+python3 scripts/evaluate_transmissions.py /tmp/openscanner-transmissions.db \
+  http://127.0.0.1:8099 /tmp/transmission-evaluation.json
+```
+
+The evaluator opens SQLite read-only. The label manifest in
+`tests/transmission_support_cases.json` contains IDs and human expectations, with
+22 development examples and 8 held-out examples. It requires the matching support
+snapshot. Reports include original transcripts and should remain with the support
+investigation. These small sample scores measure this snapshot, not production accuracy.
+On the provided November 2026 support snapshot with `qwen3:4b`, the labeled sample
+produced 29/30 expected classifications (21/22 development, 8/8 held out); all 30
+responses matched the JSON Schema. One noninjury fall requesting assistance was
+classified as `welfare_check` instead of the expected `public_assistance`. Keep this
+case as a known mismatch, not an exact accuracy estimate for the full database.
+
+To isolate classification from network availability, an evaluation-only server may
+point its geocoding endpoints at an unavailable local port; location extraction is
+still checked, while geocoding gracefully returns null. Never use receiver/channel
+coordinates in the database as incident coordinates.
+
 ## Address extraction and automatic location lookup
 
 `POST /address` accepts JSON text, extracts a location, and automatically resolves
@@ -234,11 +376,31 @@ selected provider match (including `matchedAddress`, numeric `latitude` and
 responses, timeouts, and ambiguous results do not discard the extracted address:
 `/address` still returns HTTP 200 with `geocode: null`.
 
-For street addresses, the server calls Census automatically. For business names,
-it checks the configured local directory, then Photon/OpenStreetMap. The original
-text is supplied only to the local LLM for candidate selection. Only the extracted
-address/name and locality are sent externally. A successful business match fills
-the address fields from the provider/directory, never from the LLM's memory.
+For street addresses, the server calls Census automatically. When Census returns
+no matches and a house number and street are available, it can search Photon for
+similar street names in the requested city/state. Street type and directional
+prefixes must agree; name edits are bounded. If cross streets were extracted,
+each must have a similar local street whose bounding box is near the candidate
+street. This is proximity evidence, not proof that the roads intersect. The
+unchanged house number is then re-geocoded by Census. A unique address matching
+the number, candidate street, city and state is required. Multiple plausible
+addresses, missing cross-street evidence, or failures leave `geocode: null`.
+
+For example, `16 Shepherd Ave` with cross streets `Ivan Guile Road and Cole Street`
+can resolve to `16 SHEPARD AVE, SALEM, NH, 03079`. The extracted `address`, `street`
+and `crossStreet` stay as transcribed; the corrected provider address appears only
+in `geocode`. Photon street centroids are never returned as house coordinates.
+The fallback is used by automatic enrichment on `/address`, `/transmission`, and
+`/transcribe` with metadata, rather than the standalone `/geocode` route.
+`Geocoding:StreetEndpoint` defaults to `https://photon.komoot.io/api/`. Street
+requests are serialized/rate limited, use the geocoding timeout, and cache results
+for 24 hours by number, street, locality and cross streets. Additional requests
+can add latency. Only extracted location information is sent to providers.
+
+For business names, lookup checks the configured local directory, then
+Photon/OpenStreetMap. The original text is supplied only to the local LLM for
+candidate selection. A successful business match fills address fields from the
+provider/directory, never from the LLM's memory.
 
 The configured default area is Salem, NH (`Geocoding:DefaultCity` and
 `Geocoding:DefaultState`). Missing locality is added to lookup queries; explicit
@@ -423,3 +585,9 @@ Display the returned `geocode.attribution` with OpenStreetMap-derived results
 matches include their source URL in that field. No API key or additional GPU model
 is required. The LLM is only used to extract names/select candidates, not to invent
 coordinates or repair uncertain business names from memory.
+
+Street fallback checks: `python3 scripts/test_street_fallback.py` uses local mock
+providers to exercise locality, cross-street proximity, ambiguity, number
+preservation, outages and caching. `python3 scripts/test_shepherd_live.py
+http://127.0.0.1:8099` checks the actual cardiac-arrest transmission against Ollama,
+Photon and Census; it requires those services to be available.
