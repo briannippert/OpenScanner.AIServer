@@ -30,6 +30,7 @@ The installer will:
 
 ### Installer Options
 
+- `--skip-update`: Build local code without pulling main (use this when installing a feature branch)
 - `--deps-only`: Install dependencies and download the model, then exit without building or installing the service
 - `--port=NNNN`: Set the listening port (skips the interactive prompt)
 - `--rebuild-whisper`: Force a clean rebuild of whisper.cpp (useful after installing CUDA)
@@ -72,8 +73,8 @@ Edit `appsettings.json` (the installer does this automatically):
     "WhisperServerBinary": "/path/to/whisper.cpp/build/bin/whisper-server",
     "DefaultModel": "large-v3-turbo-q5_0",
     "BasePort": 8100,
-    "InstancesPerModel": 2,
-    "MaxResidentModels": 2,
+    "InstancesPerModel": 1,
+    "MaxResidentModels": 1,
     "Threads": 0,
     "UseGpu": true,
     "StartupTimeoutSeconds": 120,
@@ -89,8 +90,8 @@ Edit `appsettings.json` (the installer does this automatically):
 | `WhisperServerBinary` | — | Path to the built `whisper-server` binary |
 | `DefaultModel` | `large-v3-turbo-q5_0` | Model pre-warmed at startup and used when a request omits `model` |
 | `BasePort` | `8100` | First loopback port for spawned `whisper-server` processes |
-| `InstancesPerModel` | `2` | Processes per model → concurrency for a single model |
-| `MaxResidentModels` | `2` | Distinct models kept in memory (LRU eviction beyond this) |
+| `InstancesPerModel` | `1` | Processes per model → concurrency for a single model |
+| `MaxResidentModels` | `1` | Distinct models kept in memory (LRU eviction beyond this) |
 | `Threads` | `0` | Threads per process (`0` = all cores) |
 | `UseGpu` | `true` | Pass `-ng` to disable GPU when `false` |
 | `StartupTimeoutSeconds` | `120` | How long to wait for a model to load |
@@ -176,3 +177,85 @@ Re-run the installer to pull the latest code, rebuild, and restart:
 ## License
 
 MIT
+
+## Address extraction (local LLM)
+
+`POST /address` accepts JSON text and returns a fixed JSON object. It uses a separately
+running local [Ollama](https://ollama.com/) service; the Whisper installer does not
+install Ollama or download the LLM. After installing and starting Ollama on the server:
+
+```bash
+ollama pull qwen3:4b
+```
+
+Configure `Address:OllamaUrl` (default `http://127.0.0.1:11434/`), `Address:Model`
+(default `qwen3:4b`) and `Address:TimeoutSeconds` (default `120`) in appsettings.json.
+Environment overrides such as `Address__Model` also work. Keep Ollama bound to loopback.
+
+```bash
+curl http://localhost:8090/address \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"Dispatch, respond to 123 Main Street, apartment 4, Springfield."}'
+```
+
+Example response (actual extraction depends on the model):
+
+```json
+{
+  "address": "123 Main Street, apartment 4, Springfield",
+  "houseNumber": "123",
+  "street": "Main Street",
+  "unit": "4",
+  "city": "Springfield",
+  "state": null,
+  "postalCode": null,
+  "country": null,
+  "crossStreet": null
+}
+```
+
+The first address is extracted if several are mentioned. Intersections use `street`
+and `crossStreet`; partial addresses are supported. Missing fields are null, and
+no address produces an object with every field null. This extracts text, rather
+than validating a real location or geocoding it. Check accuracy against your own
+radio transcripts before relying on the results.
+
+Input must contain nonblank `text` of at most 2,000 characters (400 otherwise).
+Backend failures return 503, invalid/incomplete model output returns 502, and a
+queue/inference timeout returns 504. Requests are serialized, use a 4,096-token
+context and a 512-token output limit, and disable Qwen3 thinking. JSON schema
+constrains generation, and the server validates the returned shape. Address requests
+work independently of Whisper readiness.
+
+### Sharing an 8 GB GTX 1070 with Whisper
+
+With Whisper using approximately 4.1 GB, a 4B model at Q4 is a practical starting
+ceiling for fully GPU-resident inference. [Qwen3 4B Q4_K_M](https://ollama.com/library/qwen3:4b)
+has a 2.5 GB model file; runtime buffers and the KV cache require additional memory.
+This is an estimate, not a guaranteed fit. A 7–8B Q4 model generally exceeds the
+remaining budget once overhead is included; CPU offloading allows larger models
+at lower speed, depending on available system RAM.
+
+For this GPU, set `Whisper:InstancesPerModel` and `Whisper:MaxResidentModels` to `1`
+if you need to prevent additional Whisper copies consuming the remaining VRAM.
+These settings trade transcription concurrency/model caching for memory and are
+now the repository defaults. The installer subtracts `Address:ReservedVramMb`
+(default 3500 MB) before sizing the Whisper pool, in addition to driver headroom.
+This is only an estimate: it does not reserve GPU memory at runtime. Set it to 0
+when Ollama runs on another machine or address extraction is unused. Set `OLLAMA_NUM_PARALLEL=1` and
+`OLLAMA_MAX_LOADED_MODELS=1` in the **Ollama service environment**, then restart
+Ollama. Test simultaneous transcription and address extraction with `nvidia-smi`
+and check `ollama ps` for GPU placement. If memory is too tight, try `qwen3:1.7b`
+(download it and change `Address:Model`). Models stay warm for five minutes after use.
+
+[Ollama's hardware documentation](https://docs.ollama.com/gpu) lists the GTX 1070
+as compute capability 6.1 and currently requires NVIDIA driver 570 or newer for
+that generation. Verify GPU operation on the actual server; this project does
+not install or update drivers.
+
+### Development checks
+
+Run `dotnet build` and `python3 scripts/test_address_endpoint.py`. The endpoint
+checks use a local mock Ollama service and require Python 3 and loopback sockets;
+they do not download a model or require a GPU. To install this feature branch on
+the server without pulling main, use `./scripts/install_service.sh --skip-update`.

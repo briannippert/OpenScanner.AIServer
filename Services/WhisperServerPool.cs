@@ -44,8 +44,8 @@ public sealed class WhisperServerPool : IHostedService, IDisposable
     public string DefaultModel => _config["Whisper:DefaultModel"] ?? "small.en";
     public string DefaultPrompt => _config["Whisper:DefaultPrompt"] ?? "";
     private int BasePort => _config.GetValue<int?>("Whisper:BasePort") ?? 8100;
-    private int InstancesPerModel => Math.Max(1, _config.GetValue<int?>("Whisper:InstancesPerModel") ?? 2);
-    private int MaxResidentModels => Math.Max(1, _config.GetValue<int?>("Whisper:MaxResidentModels") ?? 2);
+    private int InstancesPerModel => Math.Max(1, _config.GetValue<int?>("Whisper:InstancesPerModel") ?? 1);
+    private int MaxResidentModels => Math.Max(1, _config.GetValue<int?>("Whisper:MaxResidentModels") ?? 1);
     private int Threads
     {
         get

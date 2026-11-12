@@ -3,6 +3,8 @@ using OpenScanner.WhisperServer.Services;
 var builder = WebApplication.CreateBuilder(args);
 
 builder.Services.AddHttpClient();
+builder.Services.AddHttpClient("address", client => client.Timeout = Timeout.InfiniteTimeSpan);
+builder.Services.AddSingleton<AddressExtractor>();
 // Non-logging client for internal loopback calls to whisper-server: the health
 // poll during model startup would otherwise flood the log with expected
 // connection-refused messages while the child boots.
@@ -99,6 +101,31 @@ app.MapPost("/transcribe", async (HttpRequest request, WhisperServerPool pool, I
     finally
     {
         if (File.Exists(tempPath)) File.Delete(tempPath);
+    }
+});
+
+app.MapPost("/address", async (AddressRequest request, AddressExtractor extractor,
+    HttpContext context, ILogger<Program> logger) =>
+{
+    if (string.IsNullOrWhiteSpace(request.Text) || request.Text.Length > extractor.MaxTextLength)
+        return Results.Json(new { error = $"Text is required and must be at most {extractor.MaxTextLength} characters." }, statusCode: 400);
+    try
+    {
+        return Results.Ok(await extractor.ExtractAsync(request.Text, context.RequestAborted));
+    }
+    catch (OperationCanceledException) when (!context.RequestAborted.IsCancellationRequested)
+    {
+        return Results.Json(new { error = "Address extraction timed out." }, statusCode: 504);
+    }
+    catch (HttpRequestException ex)
+    {
+        logger.LogWarning(ex, "Address model unavailable");
+        return Results.Json(new { error = "Address model unavailable. Check Ollama and the configured model." }, statusCode: 503);
+    }
+    catch (System.Text.Json.JsonException ex)
+    {
+        logger.LogWarning(ex, "Invalid address model response");
+        return Results.Json(new { error = "Address model returned invalid or incomplete JSON." }, statusCode: 502);
     }
 });
 
