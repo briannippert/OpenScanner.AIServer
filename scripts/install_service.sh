@@ -27,8 +27,13 @@ log_error() { echo -e "${RED}[ERROR] $1${NC}"; }
 DEPS_ONLY=false
 REBUILD_WHISPER=false
 PORT=""
+SKIP_UPDATE=false
 for arg in "$@"; do
   case $arg in
+    --skip-update)
+      SKIP_UPDATE=true
+      shift
+      ;;
     --deps-only)
       DEPS_ONLY=true
       shift
@@ -81,7 +86,9 @@ fi
 # 2. Update Code
 # ----------------------------------------------------------------
 log_step "Updating Repository..."
-if git remote get-url origin &> /dev/null; then
+if [ "$SKIP_UPDATE" = true ]; then
+    log_info "Using local code (--skip-update)."
+elif git remote get-url origin &> /dev/null; then
     if git pull origin main; then
         log_success "Code pulled successfully."
     else
@@ -312,12 +319,23 @@ if command -v nvidia-smi &> /dev/null && nvidia-smi &> /dev/null; then
     [ -z "$VRAM_MB" ] && VRAM_MB=0
 fi
 
+# Reserve memory for the co-located address model. Set to 0 when Ollama runs
+# elsewhere or address extraction is unused. This is a budget, not enforcement.
+ADDRESS_RESERVE_MB=$(jq -r '.Address.ReservedVramMb // 3500' "$APPSETTINGS")
+if ! [[ "$ADDRESS_RESERVE_MB" =~ ^[0-9]+$ ]] || [ "${#ADDRESS_RESERVE_MB}" -gt 6 ]; then
+    log_error "Address.ReservedVramMb must be an integer from 0 to 999999."
+    exit 1
+fi
+ADDRESS_RESERVE_MB=$((10#$ADDRESS_RESERVE_MB))
+
 # Only size against VRAM when we actually built with CUDA and have a reading.
 if [ -n "$CMAKE_EXTRA_ARGS" ] && [ "$VRAM_MB" -gt 0 ] && [ "$PER_INSTANCE_MB" -gt 0 ]; then
     USE_GPU=true
     # Leave headroom for the display/driver: 15% of VRAM, capped at 1500 MB.
     RESERVE=$(( VRAM_MB * 15 / 100 )); [ "$RESERVE" -gt 1500 ] && RESERVE=1500
-    USABLE=$(( VRAM_MB - RESERVE ))
+    USABLE=$(( VRAM_MB - RESERVE - ADDRESS_RESERVE_MB ))
+    [ "$USABLE" -lt 0 ] && USABLE=0
+    log_info "Reserving ${ADDRESS_RESERVE_MB} MB for address extraction."
     SLOTS=$(( USABLE / PER_INSTANCE_MB ))
     [ "$SLOTS" -lt 1 ] && SLOTS=1
 

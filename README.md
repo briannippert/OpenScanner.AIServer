@@ -30,6 +30,7 @@ The installer will:
 
 ### Installer Options
 
+- `--skip-update`: Build local code without pulling main (use this when installing a feature branch)
 - `--deps-only`: Install dependencies and download the model, then exit without building or installing the service
 - `--port=NNNN`: Set the listening port (skips the interactive prompt)
 - `--rebuild-whisper`: Force a clean rebuild of whisper.cpp (useful after installing CUDA)
@@ -72,8 +73,8 @@ Edit `appsettings.json` (the installer does this automatically):
     "WhisperServerBinary": "/path/to/whisper.cpp/build/bin/whisper-server",
     "DefaultModel": "large-v3-turbo-q5_0",
     "BasePort": 8100,
-    "InstancesPerModel": 2,
-    "MaxResidentModels": 2,
+    "InstancesPerModel": 1,
+    "MaxResidentModels": 1,
     "Threads": 0,
     "UseGpu": true,
     "StartupTimeoutSeconds": 120,
@@ -89,8 +90,8 @@ Edit `appsettings.json` (the installer does this automatically):
 | `WhisperServerBinary` | — | Path to the built `whisper-server` binary |
 | `DefaultModel` | `large-v3-turbo-q5_0` | Model pre-warmed at startup and used when a request omits `model` |
 | `BasePort` | `8100` | First loopback port for spawned `whisper-server` processes |
-| `InstancesPerModel` | `2` | Processes per model → concurrency for a single model |
-| `MaxResidentModels` | `2` | Distinct models kept in memory (LRU eviction beyond this) |
+| `InstancesPerModel` | `1` | Processes per model → concurrency for a single model |
+| `MaxResidentModels` | `1` | Distinct models kept in memory (LRU eviction beyond this) |
 | `Threads` | `0` | Threads per process (`0` = all cores) |
 | `UseGpu` | `true` | Pass `-ng` to disable GPU when `false` |
 | `StartupTimeoutSeconds` | `120` | How long to wait for a model to load |
@@ -109,6 +110,14 @@ journalctl -u openscanner-whisper -f    # View logs
 ```
 
 To run manually: `dotnet run --urls "http://0.0.0.0:8090"` (default dev port is 5000).
+
+## Swagger / API documentation
+
+Open `/swagger` on the running server (for example,
+`http://localhost:8090/swagger`) to explore and try all five endpoints, including
+WAV file uploads and JSON address requests. The OpenAPI document is available at
+`/swagger/v1/swagger.json`. Both are enabled in development and production, so
+Swagger is available when running the installed systemd service.
 
 ## API Endpoints
 
@@ -176,3 +185,241 @@ Re-run the installer to pull the latest code, rebuild, and restart:
 ## License
 
 MIT
+
+## Address extraction and automatic location lookup
+
+`POST /address` accepts JSON text, extracts a location, and automatically resolves
+its address and coordinates when possible. Extraction uses a separately
+running local [Ollama](https://ollama.com/) service; the Whisper installer does not
+install Ollama or download the LLM. After installing and starting Ollama on the server:
+
+```bash
+ollama pull qwen3:4b
+```
+
+Configure `Address:OllamaUrl` (default `http://127.0.0.1:11434/`), `Address:Model`
+(default `qwen3:4b`) and `Address:TimeoutSeconds` (default `120`) in appsettings.json.
+Environment overrides such as `Address__Model` also work. Keep Ollama bound to loopback.
+
+```bash
+curl http://localhost:8090/address \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"Dispatch, respond to 123 Main Street, apartment 4, Springfield."}'
+```
+
+Example response (actual extraction depends on the model):
+
+```json
+{
+  "address": "123 Main Street, apartment 4, Springfield",
+  "houseNumber": "123",
+  "street": "Main Street",
+  "unit": "4",
+  "city": "Springfield",
+  "state": null,
+  "postalCode": null,
+  "country": null,
+  "crossStreet": null,
+  "placeName": null,
+  "geocode": null
+}
+```
+
+The first address is extracted if several are mentioned. Intersections use `street`
+and `crossStreet`; partial addresses are supported. Missing fields are null, and
+no location produces an object with every field null, without making an external lookup.
+`placeName` contains an extracted business or landmark name. `geocode` contains the
+selected provider match (including `matchedAddress`, numeric `latitude` and
+`longitude`) or null when no match can be selected. Geocoding outages, invalid
+responses, timeouts, and ambiguous results do not discard the extracted address:
+`/address` still returns HTTP 200 with `geocode: null`.
+
+For street addresses, the server calls Census automatically. For business names,
+it checks the configured local directory, then Photon/OpenStreetMap. The original
+text is supplied only to the local LLM for candidate selection. Only the extracted
+address/name and locality are sent externally. A successful business match fills
+the address fields from the provider/directory, never from the LLM's memory.
+
+The configured default area is Salem, NH (`Geocoding:DefaultCity` and
+`Geocoding:DefaultState`). Missing locality is added to lookup queries; explicit
+extracted locality takes precedence. The extraction prompt distinguishes Route 28,
+radio unit IDs and Massachusetts license plates from house numbers and location
+states. Model behavior still needs evaluation against actual radio transcripts.
+Automatic lookup can add the geocoding timeout and a second LLM call to latency.
+Extracted queries over 500 characters are preserved but not sent for lookup.
+
+Input must contain nonblank `text` of at most 2,000 characters (400 otherwise).
+Backend failures return 503, invalid/incomplete model output returns 502, and a
+queue/inference timeout returns 504. Requests are serialized, use a 4,096-token
+context and a 512-token output limit, and disable Qwen3 thinking. JSON schema
+constrains generation, and the server validates the returned shape. Address requests
+work independently of Whisper readiness.
+
+### Sharing an 8 GB GTX 1070 with Whisper
+
+With Whisper using approximately 4.1 GB, a 4B model at Q4 is a practical starting
+ceiling for fully GPU-resident inference. [Qwen3 4B Q4_K_M](https://ollama.com/library/qwen3:4b)
+has a 2.5 GB model file; runtime buffers and the KV cache require additional memory.
+This is an estimate, not a guaranteed fit. A 7–8B Q4 model generally exceeds the
+remaining budget once overhead is included; CPU offloading allows larger models
+at lower speed, depending on available system RAM.
+
+For this GPU, set `Whisper:InstancesPerModel` and `Whisper:MaxResidentModels` to `1`
+if you need to prevent additional Whisper copies consuming the remaining VRAM.
+These settings trade transcription concurrency/model caching for memory and are
+now the repository defaults. The installer subtracts `Address:ReservedVramMb`
+(default 3500 MB) before sizing the Whisper pool, in addition to driver headroom.
+This is only an estimate: it does not reserve GPU memory at runtime. Set it to 0
+when Ollama runs on another machine or address extraction is unused. Set `OLLAMA_NUM_PARALLEL=1` and
+`OLLAMA_MAX_LOADED_MODELS=1` in the **Ollama service environment**, then restart
+Ollama. Test simultaneous transcription and address extraction with `nvidia-smi`
+and check `ollama ps` for GPU placement. If memory is too tight, try `qwen3:1.7b`
+(download it and change `Address:Model`). Models stay warm for five minutes after use.
+
+[Ollama's hardware documentation](https://docs.ollama.com/gpu) lists the GTX 1070
+as compute capability 6.1 and currently requires NVIDIA driver 570 or newer for
+that generation. Verify GPU operation on the actual server; this project does
+not install or update drivers.
+
+### Development checks
+
+Run `dotnet build` and `python3 scripts/test_address_endpoint.py`. The endpoint
+checks use a local mock Ollama service and require Python 3 and loopback sockets;
+they do not download a model or require a GPU. They also verify Swagger, Census
+geocoding, caching, throttling, and LLM candidate selection using mock responses. To install this feature branch on
+the server without pulling main, use `./scripts/install_service.sh --skip-update`.
+
+
+## US address coordinates
+
+`POST /geocode` uses the free [US Census geocoder](https://geocoding.geo.census.gov/geocoder/Geocoding_Services_API.html)
+with no API key or GPU required. It sends only the supplied address to the external
+provider. `/address` now calls the same geocoding/selection service automatically.
+Use `/geocode` for a standalone street-address lookup with optional context;
+include city/state or ZIP explicitly on this standalone endpoint.
+
+```bash
+curl http://localhost:8090/geocode \
+  -H 'Content-Type: application/json' \
+  -d '{"address":"4600 Silver Hill Rd, Washington, DC 20233"}'
+```
+
+Response shape (illustrative coordinates):
+
+```json
+{
+  "found": true,
+  "matches": [
+    {
+      "matchedAddress": "4600 SILVER HILL RD, WASHINGTON, DC, 20233",
+      "latitude": 38.85,
+      "longitude": -76.94
+    }
+  ],
+  "provider": "US Census Bureau",
+  "selectedMatchIndex": 0,
+  "selectionStatus": "single_match",
+  "selectedMatch": {
+    "matchedAddress": "4600 SILVER HILL RD, WASHINGTON, DC, 20233",
+    "latitude": 38.85,
+    "longitude": -76.94
+  }
+}
+```
+
+No match returns HTTP 200 with `found: false`, `matches: []`, and `selectedMatch: null`.
+A single candidate is selected directly. With multiple candidates, the local LLM
+compares the address and optional `context` against the candidate addresses. All
+candidates remain in `matches`; `selectedMatchIndex` is zero-based and
+`selectedMatch` contains the selected provider result, never LLM-generated coordinates.
+
+```json
+{
+  "address": "123 Main St, VA",
+  "context": "Dispatch is responding in South City."
+}
+```
+
+Selection statuses are `no_match`, `single_match`, `llm_selected`, `ambiguous`
+(insufficient evidence), or `llm_unavailable` (model failure, timeout, or invalid
+output). In the latter two cases the selected index and match are null. A selection
+is a model suggestion, not a verified location. Candidate lists over 20 entries or
+selection prompts over 6,000 characters remain ambiguous to avoid truncation.
+The original transcript can be supplied as context; context stays with the local
+Ollama service and is not sent to Census. Ranking uses the same model and inference
+queue as `/address`, with the configured address-model timeout. It does not load
+a second LLM. Cached geocoding candidates are ranked afresh for each context.
+
+Census estimates points along street
+address ranges; these are not guaranteed rooftop positions. Numbered street
+addresses are required by the provider; bare intersections, landmarks, and incomplete
+transcripts may not resolve. This endpoint does not supply map tiles.
+
+The address must be nonblank and at most 500 characters; optional context is limited
+to 2,000 characters (400 otherwise). Geocoding provider failures
+return 503, malformed results return 502, and geocoding timeouts return 504. Ranking failures return the successful geocoding
+response with `llm_unavailable`. Calls to Census are
+serialized and spaced by at least one second per server process. Up to 1,000 query
+results (including no matches) are cached in memory for 24 hours; restart clears
+the cache. Errors are not cached or automatically retried.
+
+`Geocoding:Endpoint`, `Geocoding:Benchmark` and `Geocoding:TimeoutSeconds` configure
+the Census-compatible backend, dataset (default `Public_AR_Current`), and total
+queue/request timeout (default 30 seconds). Environment overrides use double
+underscores, for example `Geocoding__TimeoutSeconds=60`.
+
+
+### Business names and local radio aliases
+
+For example, submit the actual transcript to `/address`:
+
+```json
+{"text":"117, copy, stop. Go ahead. 28, Dollar Tree, Mass, 4, Paul, Henry, Edward, 93. Copy."}
+```
+
+A successful lookup returns `placeName: "Dollar Tree"`, the resolved street address,
+and a `geocode` object. The repository includes an entry for 294 N Broadway,
+Salem, NH 03079, verified against [Dollar Tree's store locator](https://locations.dollartree.com/nh/salem/294-n-broadway-suite-4).
+The store is Suite 4; Census resolves the street address rather than a suite entrance.
+Census returned latitude `42.7971735138`, longitude `-71.238059822759` during a
+live verification. Coordinates are fetched at runtime rather than hard-coded.
+
+Maintain `Geocoding:Places` for known local businesses and confirmed radio aliases:
+
+```json
+{
+  "Name": "Example Business",
+  "Aliases": ["confirmed radio nickname"],
+  "Address": "123 Main Street, Salem, NH 03079",
+  "HouseNumber": "123",
+  "Street": "Main Street",
+  "City": "Salem",
+  "State": "NH",
+  "PostalCode": "03079",
+  "Source": "https://example.com/location"
+}
+```
+
+This is a configuration example, not an actual verified business. Entries match
+names/aliases exactly ignoring case and require matching city/state. Their street
+addresses are geocoded with Census. Do not add speculative aliases for uncertain
+transcripts such as “tailwind chasers” until the intended place is confirmed.
+
+Names absent from the directory use [Photon](https://github.com/komoot/photon).
+Results must match the requested town, state and US country code; even one fuzzy
+candidate is checked by the LLM against the business name and transcript before
+selection. Missing locality metadata is rejected rather than guessing. NH and
+New Hampshire are treated as equivalent. Coverage is incomplete: the live Photon
+query for Dollar Tree returned other NH towns, which is why the verified local
+entry is useful. An unknown or uncertain name can remain unresolved.
+
+`Geocoding:PlaceEndpoint` defaults to `https://photon.komoot.io/api/` and can point
+to another Photon-compatible instance. The public demo permits reasonable use,
+may throttle requests, and has no availability guarantee; use a private instance
+for sustained/high-volume operation. The server caches up to 1,000 place queries
+for 24 hours and spaces uncached calls at least one second apart per process.
+Display the returned `geocode.attribution` with OpenStreetMap-derived results
+([OpenStreetMap copyright](https://www.openstreetmap.org/copyright)). Local-directory
+matches include their source URL in that field. No API key or additional GPU model
+is required. The LLM is only used to extract names/select candidates, not to invent
+coordinates or repair uncertain business names from memory.
