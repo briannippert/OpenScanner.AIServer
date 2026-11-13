@@ -1,7 +1,7 @@
 using System.Text.Json;
 using System.Text.RegularExpressions;
 
-namespace OpenScanner.WhisperServer.Services;
+namespace OpenScanner.AIServer.Services;
 
 public sealed record AddressRequest(string? Text, string? DefaultCity = null, string? DefaultState = null);
 

@@ -1,6 +1,6 @@
 using System.Text.Json;
 
-namespace OpenScanner.WhisperServer.Services;
+namespace OpenScanner.AIServer.Services;
 
 // Shared by direct geocoding and automatic enrichment after address extraction.
 public sealed class GeocodeResolver(AddressGeocoder geocoder, AddressExtractor extractor, PlaceGeocoder places)

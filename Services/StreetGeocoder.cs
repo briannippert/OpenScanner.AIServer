@@ -2,7 +2,7 @@ using System.Text.Json;
 using System.Text.RegularExpressions;
 using Microsoft.Extensions.Caching.Memory;
 
-namespace OpenScanner.WhisperServer.Services;
+namespace OpenScanner.AIServer.Services;
 
 // Photon supplies street names, never house coordinates. Census must validate the
 // unchanged house number on a unique, similar street in the requested locality.

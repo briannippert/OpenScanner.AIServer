@@ -2,7 +2,7 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using Microsoft.Extensions.Caching.Memory;
 
-namespace OpenScanner.WhisperServer.Services;
+namespace OpenScanner.AIServer.Services;
 
 public sealed record GeocodeRequest(string? Address, string? Context = null);
 public sealed record GeocodeMatch(string MatchedAddress, double Latitude, double Longitude,

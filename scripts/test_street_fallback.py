@@ -126,7 +126,7 @@ env = dict(os.environ, Address__OllamaUrl=upstream, Geocoding__Endpoint=upstream
     Geocoding__StreetEndpoint=upstream+'/streets', Geocoding__TimeoutSeconds='20',
     Whisper__WhisperServerBinary='/nonexistent/test-whisper', DOTNET_ENVIRONMENT='Production')
 with tempfile.TemporaryFile(mode='w+') as log:
-    app = subprocess.Popen(['dotnet', 'bin/Debug/net10.0/OpenScanner.WhisperServer.dll', '--urls', base],
+    app = subprocess.Popen(['dotnet', 'bin/Debug/net10.0/OpenScanner.AIServer.dll', '--urls', base],
         cwd=ROOT, env=env, stdout=log, stderr=log)
     try:
         for _ in range(100):

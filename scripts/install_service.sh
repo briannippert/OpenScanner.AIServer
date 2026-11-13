@@ -2,7 +2,7 @@
 set -e
 
 # =====================================================
-# OpenScanner WhisperServer Installer
+# OpenScanner AI Server Installer
 # =====================================================
 # Installs system dependencies, builds whisper.cpp,
 # downloads Whisper and Ollama models, builds the .NET server,
@@ -112,23 +112,29 @@ log_info "User: $USER ($HOME)"
 # 1. Stop Existing Service
 # ----------------------------------------------------------------
 log_step "Stopping existing service..."
-WAS_RUNNING=false
+SERVICE_NAME="openscanner-ai"
+# Installs before the rename used this unit name; it is migrated in step 9.
+LEGACY_SERVICE_NAME="openscanner-whisper"
+RESTORE_UNIT=""
 SERVICE_RESTARTED=false
 restore_existing_service() {
     local result=$?
     trap - EXIT
-    if [ "$WAS_RUNNING" = true ] && [ "$SERVICE_RESTARTED" = false ]; then
-        log_info "Restoring the previously running Whisper service..."
-        sudo systemctl start openscanner-whisper || log_warn "Could not restore the service; check systemctl status openscanner-whisper."
+    if [ -n "$RESTORE_UNIT" ] && [ "$SERVICE_RESTARTED" = false ]; then
+        log_info "Restoring the previously running service ($RESTORE_UNIT)..."
+        sudo systemctl start "$RESTORE_UNIT" || log_warn "Could not restore the service; check systemctl status $RESTORE_UNIT."
     fi
     exit "$result"
 }
 trap restore_existing_service EXIT
-if systemctl is-active --quiet openscanner-whisper; then
-    WAS_RUNNING=true
-    sudo systemctl stop openscanner-whisper
-    log_info "Service stopped."
-else
+for unit in "$SERVICE_NAME" "$LEGACY_SERVICE_NAME"; do
+    if systemctl is-active --quiet "$unit"; then
+        sudo systemctl stop "$unit"
+        if [ -z "$RESTORE_UNIT" ]; then RESTORE_UNIT="$unit"; fi
+        log_info "Stopped $unit."
+    fi
+done
+if [ -z "$RESTORE_UNIT" ]; then
     log_info "Service was not running."
 fi
 
@@ -465,8 +471,16 @@ fi
 # ----------------------------------------------------------------
 log_step "Configuring Systemd Service..."
 
-SERVICE_FILE="/etc/systemd/system/openscanner-whisper.service"
-NET_EXEC="$PROJECT_ROOT/bin/Release/net10.0/publish/OpenScanner.WhisperServer"
+SERVICE_FILE="/etc/systemd/system/$SERVICE_NAME.service"
+LEGACY_SERVICE_FILE="/etc/systemd/system/$LEGACY_SERVICE_NAME.service"
+if [ -f "$LEGACY_SERVICE_FILE" ]; then
+    # Remove the pre-rename unit so two services never compete for the same port.
+    log_info "Migrating $LEGACY_SERVICE_NAME to $SERVICE_NAME..."
+    sudo systemctl stop "$LEGACY_SERVICE_NAME" 2>/dev/null || true
+    sudo systemctl disable "$LEGACY_SERVICE_NAME" 2>/dev/null || true
+    sudo rm -f "$LEGACY_SERVICE_FILE"
+fi
+NET_EXEC="$PROJECT_ROOT/bin/Release/net10.0/publish/OpenScanner.AIServer"
 
 chmod +x "$NET_EXEC"
 
@@ -475,7 +489,7 @@ OLLAMA_AFTER=""
 if [ "$OLLAMA_MANAGED_LOCAL" = true ]; then OLLAMA_AFTER=" ollama.service"; fi
 cat <<EOF > "$TEMP_SERVICE_FILE"
 [Unit]
-Description=OpenScanner Whisper Transcription Server
+Description=OpenScanner AI Server
 After=network.target$OLLAMA_AFTER
 
 [Service]
@@ -497,8 +511,8 @@ sudo chown root:root "$SERVICE_FILE"
 sudo chmod 644 "$SERVICE_FILE"
 
 sudo systemctl daemon-reload
-sudo systemctl enable openscanner-whisper
-sudo systemctl restart openscanner-whisper
+sudo systemctl enable "$SERVICE_NAME"
+sudo systemctl restart "$SERVICE_NAME"
 SERVICE_RESTARTED=true
 
 # ----------------------------------------------------------------
@@ -518,8 +532,8 @@ if [ "$SKIP_OLLAMA" = false ]; then
     echo -e "   ${BOLD}LLM:${NC}     $LLM_MODEL ($OLLAMA_URL)"
 fi
 echo -e "   ${BOLD}Port:${NC}    $PORT"
-echo -e "   ${BOLD}Status:${NC}  systemctl status openscanner-whisper"
-echo -e "   ${BOLD}Logs:${NC}    journalctl -u openscanner-whisper -f"
+echo -e "   ${BOLD}Status:${NC}  systemctl status $SERVICE_NAME"
+echo -e "   ${BOLD}Logs:${NC}    journalctl -u $SERVICE_NAME -f"
 echo -e "   ${BOLD}Health:${NC}  http://$IP_ADDR:$PORT/health"
 echo ""
 echo -e "   To connect from OpenScanner, set the remote URL to:"

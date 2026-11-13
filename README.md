@@ -1,6 +1,13 @@
-# OpenScanner.WhisperServer
+# OpenScanner.AIServer
 
-A lightweight .NET Web API server that provides remote Whisper AI transcription for [OpenScanner](https://github.com/briannippert/OpenScanner). Run this on a more powerful machine to offload speech-to-text processing from your Raspberry Pi.
+A .NET Web API server that provides the AI features for [OpenScanner](https://github.com/briannippert/OpenScanner). Run it on a more powerful machine to offload this work from your Raspberry Pi:
+
+- **Transcription:** Whisper speech-to-text for radio transmissions
+- **Incident metadata:** call type, service, status and a summary, extracted from each transmission by a local LLM (Ollama)
+- **Location lookup:** addresses, intersections and businesses, geocoded through the US Census and OpenStreetMap
+
+> Formerly **OpenScanner.WhisperServer**. Existing installs are migrated automatically: rerunning
+> `./scripts/install_service.sh` replaces the old `openscanner-whisper` service with `openscanner-ai`.
 
 Unlike a per-clip `whisper-cli` invocation, this server keeps models **resident in memory** by managing a pool of long-lived [`whisper-server`](https://github.com/ggerganov/whisper.cpp/tree/master/examples/server) processes. The first request for a model loads it; subsequent requests reuse the warm process, and multiple clips can be transcribed **concurrently**.
 
@@ -12,8 +19,8 @@ Unlike a per-clip `whisper-cli` invocation, this server keeps models **resident 
 ## Quick Start
 
 ```bash
-git clone https://github.com/briannippert/OpenScanner.WhisperServer.git
-cd OpenScanner.WhisperServer
+git clone https://github.com/briannippert/OpenScanner.AIServer.git
+cd OpenScanner.AIServer
 
 chmod +x scripts/*.sh
 ./scripts/install_service.sh
@@ -154,8 +161,8 @@ Ports `BasePort` … `BasePort + InstancesPerModel × MaxResidentModels` are use
 If installed via the installer, the server runs as a systemd service:
 
 ```bash
-systemctl status openscanner-whisper    # Check status
-journalctl -u openscanner-whisper -f    # View logs
+systemctl status openscanner-ai    # Check status
+journalctl -u openscanner-ai -f    # View logs
 ```
 
 To run manually: `dotnet run --urls "http://0.0.0.0:8090"` (default dev port is 5000).

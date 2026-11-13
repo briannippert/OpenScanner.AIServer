@@ -1,6 +1,6 @@
-using OpenScanner.WhisperServer.Api;
+using OpenScanner.AIServer.Api;
 using Microsoft.OpenApi;
-using OpenScanner.WhisperServer.Services;
+using OpenScanner.AIServer.Services;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -9,9 +9,9 @@ builder.Services.AddSwaggerGen(options =>
 {
     options.SwaggerDoc("v1", new OpenApiInfo
     {
-        Title = "OpenScanner Whisper Server",
+        Title = "OpenScanner AI Server",
         Version = "v1",
-        Description = "Local audio transcription and address extraction."
+        Description = "Local audio transcription, incident classification, and location lookup."
     });
     options.SupportNonNullableReferenceTypes();
     options.OperationFilter<TranscriptionOperationFilter>();
@@ -25,7 +25,7 @@ builder.Services.AddSingleton<LocationEnricher>();
 builder.Services.AddHttpClient("geocoding", client =>
 {
     client.Timeout = Timeout.InfiniteTimeSpan;
-    client.DefaultRequestHeaders.UserAgent.ParseAdd("OpenScanner.WhisperServer/1.0");
+    client.DefaultRequestHeaders.UserAgent.ParseAdd("OpenScanner.AIServer/1.0");
 }).RemoveAllLoggers();
 // One shared per-host rate limit for Census and Photon across every geocoder.
 builder.Services.AddSingleton<UpstreamThrottle>();

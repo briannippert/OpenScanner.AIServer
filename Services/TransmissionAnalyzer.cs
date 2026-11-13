@@ -1,6 +1,6 @@
-using OpenScanner.WhisperServer.Api;
+using OpenScanner.AIServer.Api;
 
-namespace OpenScanner.WhisperServer.Services;
+namespace OpenScanner.AIServer.Services;
 
 public sealed class TransmissionAnalyzer(AddressExtractor extractor, LocationEnricher locations)
 {

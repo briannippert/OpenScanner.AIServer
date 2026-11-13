@@ -199,7 +199,7 @@ env=dict(os.environ, Address__OllamaUrl=f'http://127.0.0.1:{backend.server_port}
          Whisper__ModelsDir=str(fixture_dir), Whisper__DefaultModel='test', Whisper__BasePort=str(whisper_port),
          Whisper__UseGpu='false', MOCK_TRANSCRIPT_FILE=str(transcript_file))
 with tempfile.TemporaryFile(mode='w+') as log:
-    app=subprocess.Popen(['dotnet','bin/Debug/net10.0/OpenScanner.WhisperServer.dll','--urls',base_url],cwd=ROOT,env=env,stdout=log,stderr=log)
+    app=subprocess.Popen(['dotnet','bin/Debug/net10.0/OpenScanner.AIServer.dll','--urls',base_url],cwd=ROOT,env=env,stdout=log,stderr=log)
     try:
         for _ in range(100):
             try: urllib.request.urlopen(base_url + '/models'); break

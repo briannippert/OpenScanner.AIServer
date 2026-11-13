@@ -2,7 +2,7 @@ using System.Collections.Concurrent;
 using System.Net.Http.Json;
 using System.Text.Json;
 
-namespace OpenScanner.WhisperServer.Services;
+namespace OpenScanner.AIServer.Services;
 
 /// <summary>
 /// One request per second per upstream host, shared by every geocoder that calls it

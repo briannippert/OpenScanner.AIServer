@@ -1,7 +1,7 @@
-using OpenScanner.WhisperServer.Api;
+using OpenScanner.AIServer.Api;
 using System.Text.RegularExpressions;
 
-namespace OpenScanner.WhisperServer.Services;
+namespace OpenScanner.AIServer.Services;
 
 public sealed class LocationEnricher(GeocodeResolver resolver, PlaceGeocoder places, StreetGeocoder streets, ILogger<LocationEnricher> logger)
 {

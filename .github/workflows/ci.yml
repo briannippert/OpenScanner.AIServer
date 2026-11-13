@@ -36,7 +36,7 @@ jobs:
       - name: Restore
         run: dotnet restore
 
-      # The test scripts launch bin/Debug/net10.0/OpenScanner.WhisperServer.dll.
+      # The test scripts launch bin/Debug/net10.0/OpenScanner.AIServer.dll.
       - name: Build
         run: dotnet build --no-restore --configuration Debug -p:WarningsAsErrors=nullable
 
