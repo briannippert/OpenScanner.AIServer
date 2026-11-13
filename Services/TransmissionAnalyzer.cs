@@ -21,4 +21,9 @@ public static class LocationDefaults
     public static bool Valid(string? city, string? state) => new[] { city, state }
         .All(v => v is null || v.Length <= 100 && !v.Any(char.IsControl) && !v.Contains(','));
     public const string Error = "Default city/state must be at most 100 characters without commas or control characters.";
+
+    /// <summary>Blank means "not supplied" on every endpoint; values are case-insensitive.</summary>
+    public static string? NormalizeService(string? value) => Normalize(value)?.ToLowerInvariant();
+    public static bool ValidService(string? service) => service is null or "police" or "fire";
+    public const string ServiceError = "Service must be police or fire when supplied.";
 }

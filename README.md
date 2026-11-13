@@ -138,12 +138,14 @@ Edit `appsettings.json` (the installer does this automatically):
 | `DefaultModel` | `large-v3-turbo-q5_0` | Model pre-warmed at startup and used when a request omits `model` |
 | `BasePort` | `8100` | First loopback port for spawned `whisper-server` processes |
 | `InstancesPerModel` | `1` | Processes per model → concurrency for a single model |
-| `MaxResidentModels` | `1` | Distinct models kept in memory (LRU eviction beyond this) |
+| `MaxResidentModels` | `1` | Distinct models kept in memory (LRU eviction beyond this; a model with requests in flight is evicted only after they finish) |
 | `Threads` | `0` | Threads per process (`0` = all cores) |
 | `UseGpu` | `true` | Pass `-ng` to disable GPU when `false` |
 | `StartupTimeoutSeconds` | `120` | How long to wait for a model to load |
 | `TimeoutSeconds` | `120` | Per-inference request timeout |
 | `DefaultPrompt` | radio prompt | Decoding bias when a request omits `prompt` |
+
+If a whisper-server process exits unexpectedly, the next request for that model replaces it automatically. A model load that is in progress continues even if the requesting client disconnects.
 
 Ports `BasePort` … `BasePort + InstancesPerModel × MaxResidentModels` are used internally and only bound to `127.0.0.1`. Only the .NET server's own port is exposed on the network.
 
@@ -212,6 +214,10 @@ Response:
 ```json
 { "text": "Unit 1, responding code 3 to Main and First." }
 ```
+
+`{"text": ""}` means the audio was blank or silent. Failures return an `{"error": ...}` body instead:
+400 for an invalid request or an unknown/uninstalled `model`, 502 when whisper-server fails or
+crashes during inference, 503 when Whisper is not configured, and 504 when inference times out.
 
 ## Connecting to OpenScanner
 
@@ -325,14 +331,32 @@ case insensitive); when supplied it overrides inference. Otherwise service is
 inferred only when clear, or null. The model classifies the first incident mentioned.
 
 Stable call types for filters: `traffic_stop`, `traffic_collision`, `fire`, `medical`,
-`rescue`, `alarm`, `assault`, `domestic_disturbance`, `theft`, `burglary`,
+`rescue`, `alarm`, `security_alarm`, `assault`, `domestic_disturbance`, `theft`, `burglary`,
 `suspicious_activity`, `welfare_check`, `disturbance`, `hazard`, `public_assistance`,
 `other`. `other` represents substantive incident information with an unknown type.
-For this application's agency policy, `welfare_check` is a police category.
-Fire-service results never return it: patient complaints (including faintness) are
-`medical`, practical nonmedical help is `public_assistance`, and an unspecified
-incident type is `other`. The model schema excludes welfare checks when fire
-context is supplied; a server check also enforces the rule for inferred fire context.
+Supplied `service` is the source channel and is authoritative. It constrains both
+the model's category enum and the returned service; the server enforces the same
+allowlists even if a model violates its output schema. With no supplied service,
+the model may infer it, and an inferred service's output still uses its allowlist.
+
+| Channel | Allowed call types |
+| --- | --- |
+| Police | `traffic_stop`, `traffic_collision`, `security_alarm`, `assault`, `domestic_disturbance`, `theft`, `burglary`, `suspicious_activity`, `welfare_check`, `disturbance`, `hazard`, `public_assistance`, `other` |
+| Fire | `traffic_collision`, `fire`, `medical`, `rescue`, `alarm`, `hazard`, `public_assistance`, `other` |
+
+`security_alarm` is a police security/burglar/residential motion alarm, not a
+confirmed burglary. `alarm` is reserved for fire-service alarms. For example,
+“43 Woodmeadow Drive, residential alarm, several motion alarms” with
+`service: "police"` returns `security_alarm` and stays on the police channel.
+OpenScanner should include the new category in its police call filters.
+
+Fire results cannot use police welfare/security/traffic-stop categories; police
+results cannot use fire/medical/rescue/alarm categories. A call whose factual
+category is unavailable on its channel becomes `other`, preserving its summary
+and location. A legacy model response of `alarm` on police maps to `security_alarm`;
+`welfare_check` on fire maps to `public_assistance`. Other invalid channel/category
+combinations map to `other`. These restrictions implement the application's
+channel taxonomy, rather than a claim about which agencies can respond in reality.
 
 “Fire alarm” commonly identifies dispatch in phrases like “Fire alarm to all
 companies” or “Engine 1 to Fire alarm”. Radio-address syntax is normalized to
@@ -402,6 +426,9 @@ ollama pull qwen3:4b
 
 Configure `Address:OllamaUrl` (default `http://127.0.0.1:11434/`), `Address:Model`
 (default `qwen3:4b`) and `Address:TimeoutSeconds` (default `120`) in appsettings.json.
+Model calls run one at a time. `Address:TimeoutSeconds` bounds each call once it starts;
+`Address:QueueTimeoutSeconds` (default `300`) separately bounds the wait behind earlier calls,
+so a burst of transmissions does not time out while queued.
 Environment overrides such as `Address__Model` also work. Keep Ollama bound to loopback.
 
 ```bash
@@ -436,6 +463,26 @@ selected provider match (including `matchedAddress`, numeric `latitude` and
 `longitude`) or null when no match can be selected. Geocoding outages, invalid
 responses, timeouts, and ambiguous results do not discard the extracted address:
 `/address` still returns HTTP 200 with `geocode: null`.
+
+Provider-backed name corrections may be combined with an omitted street suffix.
+For example, Census matches `8 Graymoor Woods` to `8 BRAEMOOR WOODS RD, SALEM, NH`.
+The validator permits at most two name edits (less for short names), with the same
+number, name-token count and directional prefix. An explicitly supplied road type
+must still agree. A corrected numbered address requires a unique provider candidate
+in the requested city/state, even if the LLM selected one of several alternatives.
+The extracted spelling and apartment remain unchanged; the canonical address appears
+only in `geocode`. No hardcoded Graymoor/Braemoor alias is used.
+
+Partial numbered addresses are preserved even when no street suffix was spoken.
+For example, `16 Garabedian` remains `houseNumber: "16"`, `street: "Garabedian"`
+and can resolve through Census to `16 GARABEDIAN DR, SALEM, NH, 03079`. Validation
+allows a provider to append a recognized road type only when it was absent; it
+cannot replace an explicitly supplied Street with Drive, alter the street name,
+or change the house number. Provider-completed spelling stays in `geocode`.
+
+Crash/accident notifications are substantive `other` updates. Their stated address
+is the notification destination; it is not automatically described as a crash
+scene or traffic stop. Radio unit IDs and “in the area” do not establish a stop.
 
 For street addresses, the server calls Census automatically. If Census has no
 match, a full-address Photon search can resolve a unique OSM address/building.
@@ -502,8 +549,14 @@ provider/directory, never from the LLM's memory.
 The configured default area is Salem, NH (`Geocoding:DefaultCity` and
 `Geocoding:DefaultState`). Missing locality is added to lookup queries; explicit
 extracted locality takes precedence. The extraction prompt distinguishes Route 28,
-radio unit IDs and Massachusetts license plates from house numbers and location
-states. Model behavior still needs evaluation against actual radio transcripts.
+radio unit IDs and registration states from house numbers and incident locality.
+On police channels, terse business/location plus registration-state and plate
+announcements are traffic stops even without the word “stop”; an explicit alarm,
+theft, or other incident takes precedence. Bare numbers before business names do
+not establish a house number or route. For example, “28 Taco Bell, California,
+677-51-John-4” identifies Taco Bell and a California plate, not a California
+incident or 28 Taco Bell. Run `python3 scripts/test_traffic_stop_shorthand_live.py`
+against a running server to verify these real-model cases.
 Automatic lookup can add the geocoding timeout and a second LLM call to latency.
 Extracted queries over 500 characters are preserved but not sent for lookup.
 
@@ -543,7 +596,10 @@ not install or update drivers.
 
 ### Development checks
 
-Run `dotnet build` and `python3 scripts/test_address_endpoint.py`. The endpoint
+Run `dotnet build`, then `python3 scripts/test_address_endpoint.py`,
+`python3 scripts/test_street_fallback.py` and `python3 scripts/test_ollama_setup.py`.
+GitHub Actions runs the same build and offline checks on every push and pull request
+(`.github/workflows/ci.yml`). The endpoint
 checks use a local mock Ollama service and require Python 3 and loopback sockets;
 they do not download a model or require a GPU. They also verify Swagger, Census
 geocoding, caching, throttling, and LLM candidate selection using mock responses. To install this feature branch on
@@ -705,3 +761,18 @@ Bluff Street police transmission with a real approximate street pin. The mocked
 fallback suite includes street-center locality isolation, multiple segments,
 exact-name matching, missing/invalid points, and cache reuse; its center checks
 can also run with `--centers-only`.
+
+`python3 scripts/test_channel_types_live.py http://127.0.0.1:8099` checks police
+residential alarms, fire alarms/medical calls, traffic stops, and source-channel
+precedence with real Ollama. The model's prompt and server use the same allowlists
+as the response JSON Schema and documented API.
+
+`python3 scripts/test_partial_address_live.py http://127.0.0.1:8099` checks the
+Garabedian crash-notification sample and an accident-notification variant using
+real Ollama and Census. The mocked API checks validate omitted-suffix completion
+and rejection of a different supplied suffix or street name.
+
+`python3 scripts/test_graymoor_live.py http://127.0.0.1:8099` checks the original
+Graymoor Woods welfare-check transmission against real Ollama/Census. Mocked API
+checks also reject changed numbers, localities, directions, explicit road types,
+unrelated names, and ambiguous corrected matches.

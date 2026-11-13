@@ -30,7 +30,8 @@ public sealed class AddressExtractor(IHttpClientFactory clients, IConfiguration 
             Preserve uncertain names as spoken, never guess corrections or invent a business address.
             For a business without a street address, set address to null and keep its name in placeName.
             Radio unit IDs, talkgroup IDs, license plates, phonetic plate letters and timestamps
-            are not addresses. "Mass" before a license plate is the plate state, not the location.
+            are not addresses. Any state name/abbreviation immediately before a plate (including
+            California or Mass) describes registration, not the incident location; leave state null.
             Dispatch punctuation is unreliable: a comma between a house number and a street
             does not make them separate locations. In a traffic-stop transmission, repeated
             opening numbers identify the radio unit; use the number immediately before the
@@ -45,19 +46,49 @@ public sealed class AddressExtractor(IHttpClientFactory clients, IConfiguration 
             means address "42 Kelly Road", houseNumber "42", street "Kelly Road";
             placeName, unit, city, state, postalCode, country and crossStreet are all null.
             The trailing state, digits and phonetic letters describe the vehicle plate.
-            "28, Dollar Tree, Mass, 4, Paul, Henry, Edward, 93" means placeName "Dollar Tree",
-            street "Route 28", houseNumber null, state null. Do not treat 28 as a building number.
+            A bare opening number before a business can be a unit or route reference; never
+            invent a house number or Route without explicit street/route wording.
+            "28 Taco Bell, California, 677-51-John-4" means placeName "Taco Bell";
+            address, houseNumber, street and state null. California belongs to the plate.
+            "191, Burger King, Massachusetts, 123-Adam-Bravo-4" similarly means
+            placeName "Burger King", state null, houseNumber null, street null.
+            Registration states must NEVER override the caller's default incident locality.
+            "28, Dollar Tree, Mass, 4, Paul, Henry, Edward, 93" likewise identifies
+            Dollar Tree only, not a numbered street address.
             "clear warning", "same traffic", and "copy" alone contain no location.
             Use address for the complete extracted street location. For intersections use street and
             crossStreet. Preserve partial addresses. Never invent missing information or infer
+            street suffixes. A number plus a street name remains an address without Road/Drive/
+            Street: "16 Garabedian" means address "16 Garabedian", houseNumber "16", street
+            "Garabedian", placeName null. Preserve it for geocoding; do not discard it or append Drive.
+            In "184. In the area, 16 Garabedian for a crash notification", 184 is the radio unit,
+            while 16 Garabedian is the notification destination, not a reported crash scene.
+            Never invent missing information or infer
             city, state, postal code or country. Use null for absent fields; if there is no
             address, intersection, business, or landmark, return null for every field. Do not geocode or correct
             uncertain transcription errors.
             """;
 
+    // Radio unit identifiers: spelled-out apparatus ("Engine 1", "Ambulance 2") and
+    // short alphanumeric designators ("A2", "E-1", "L1", "C3").
+    private const string Unit = @"(?:(?:engine|rescue|medic|ambulance|tower|ladder|truck|squad|car|battalion|chief|forestry|tanker|utility)\s*\d+|[a-z]{1,2}-?\d+)\b";
+    private static readonly Regex FireAlarmAddressing = new(
+        $@"\bfire\s+alarm\b(?=\s+(?:to\s+(?:the\s+)?(?:all\s+companies|companies|units|engine|rescue|medic|ambulance|tower|ladder|battalion)\b|to\s+{Unit}|answering\b|calling\b)|\s*,\s*(?:all\s+companies\b|engine|rescue|medic|ambulance|tower|ladder|battalion|{Unit}))",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly Regex UnitToFireAlarm = new(
+        $@"\b({Unit}\s*,?\s*to\s+)fire\s+alarm\b", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    /// <summary>
+    /// "Fire alarm" is commonly the fire dispatch center's radio name. Rewrite only that
+    /// radio-address syntax to "Dispatch"; descriptions such as "respond to a fire alarm
+    /// at ..." are preserved so genuine alarm calls remain visible.
+    /// </summary>
+    internal static string NormalizeRadioAddress(string text) =>
+        UnitToFireAlarm.Replace(FireAlarmAddressing.Replace(text, "Dispatch"), "$1Dispatch");
+
     public async Task<Dictionary<string, string?>> ExtractAsync(string text, CancellationToken cancellationToken)
     {
-        using var result = await GenerateAsync(LocationInstructions, text, Schema, 512, cancellationToken);
+        using var result = await GenerateAsync(LocationInstructions, NormalizeRadioAddress(text), Schema, 512, cancellationToken);
         if (result.RootElement.ValueKind != JsonValueKind.Object || result.RootElement.EnumerateObject().Count() != Fields.Length)
             throw new JsonException("Unexpected address schema.");
         var values = new Dictionary<string, string?>();
@@ -72,18 +103,28 @@ public sealed class AddressExtractor(IHttpClientFactory clients, IConfiguration 
     }
 
     public static readonly string[] CallTypes =
-        ["traffic_stop", "traffic_collision", "fire", "medical", "rescue", "alarm",
+        ["traffic_stop", "traffic_collision", "fire", "medical", "rescue", "alarm", "security_alarm",
          "assault", "domestic_disturbance", "theft", "burglary", "suspicious_activity",
          "welfare_check", "disturbance", "hazard", "public_assistance", "other"];
     public static readonly string[] IncidentStatuses = ["dispatched", "en_route", "on_scene", "cleared"];
+    private static readonly string[] PoliceCallTypes = CallTypes.Except(["fire", "medical", "rescue", "alarm"]).ToArray();
+    private static readonly string[] FireCallTypes =
+        ["traffic_collision", "fire", "medical", "rescue", "alarm", "hazard", "public_assistance", "other"];
+    public static IReadOnlyList<string> AllowedCallTypes(string? service) => service switch
+    {
+        "police" => PoliceCallTypes,
+        "fire" => FireCallTypes,
+        _ => CallTypes
+    };
 
     public async Task<Dictionary<string, string?>?> ExtractTransmissionAsync(string text, string? service,
         CancellationToken cancellationToken)
     {
         var properties = Fields.ToDictionary(f => f, _ => (object)new { type = new[] { "string", "null" } });
-        var allowedCallTypes = service == "fire" ? CallTypes.Where(t => t != "welfare_check") : CallTypes;
+        var allowedCallTypes = AllowedCallTypes(service);
         properties["callType"] = new { type = new[] { "string", "null" }, @enum = allowedCallTypes.Cast<string?>().Append("ignore").ToArray() };
-        properties["service"] = new { type = new[] { "string", "null" }, @enum = new string?[] { "police", "fire", null } };
+        properties["service"] = new { type = new[] { "string", "null" }, @enum = service is null
+            ? new string?[] { "police", "fire", null } : [service, null] };
         properties["incidentStatus"] = new { type = new[] { "string", "null" }, @enum = IncidentStatuses.Cast<string?>().Append(null).ToArray() };
         properties["summary"] = new { type = new[] { "string", "null" } };
         var schema = new { type = "object", properties, required = properties.Keys.ToArray(), additionalProperties = false };
@@ -98,6 +139,32 @@ public sealed class AddressExtractor(IHttpClientFactory clients, IConfiguration 
             Use a concise factual summary of only what was said; never invent severity, injuries or outcomes.
             Use the most specific callType allowed by the schema; use other for substantive information
             whose call type is unknown. A traffic stop is traffic_stop, not traffic_collision.
+            On a police channel, a terse location followed by a registration state and
+            digits/phonetic plate letters is a traffic_stop announcement even without "stop".
+            "28 Taco Bell, California, 677-51-John-4" and
+            "191, Burger King, Massachusetts, 123-Adam-Bravo-4" both require
+            callType traffic_stop, never security_alarm or other.
+            Summarize as "Traffic stop at [business].", placeName is the business, state null.
+            Do not invent an alarm from a business or plate. security_alarm requires an actual
+            alarm report. A plate lookup alone without a stop or location is not enough to infer a stop;
+            explicit theft, crash, alarm or other incident context takes precedence over this shorthand.
+            A crash/accident notification is a substantive notification/follow-up, not a traffic
+            stop and not a crash reported at the notification address. Classify it as other.
+            "184. In the area, 16 Garabedian for a crash notification." -> callType other,
+            summary "In the area of 16 Garabedian for a crash notification.", address
+            "16 Garabedian", houseNumber "16", street "Garabedian", placeName null.
+            "in the area" alone does not imply a traffic stop or on_scene incident status.
+            The supplied service identifies the source CHANNEL, not an agency to infer from the
+            event. Never change police to fire because the text mentions an alarm or fire units.
+            Use only the call types offered by this request's schema. Police security/burglar/
+            residential motion alarms are security_alarm; alarm is a FIRE-only category.
+            "43 Woodmeadow Drive, residential alarm, several motion alarms" on a police channel
+            -> service police, callType security_alarm, houseNumber "43", street "Woodmeadow Drive".
+            Fire-only categories are fire, medical, rescue, alarm. Police-only categories include
+            traffic_stop, security_alarm, assault, domestic_disturbance, theft, burglary,
+            suspicious_activity, welfare_check and disturbance. Collision, hazard, assistance and
+            other are shared. If an event has no category allowed on its channel, use other and
+            retain its factual summary rather than changing the service or inventing another event.
             "Fire alarm" is commonly the radio name of the fire dispatch center, like "dispatch".
             In "Fire alarm to all companies", "Fire alarm answering", "Rescue 3 to Fire alarm",
             and "Fire alarm, Engine 1", it identifies the speaker/addressee, NOT an alarm incident.
@@ -111,6 +178,9 @@ public sealed class AddressExtractor(IHttpClientFactory clients, IConfiguration 
             "Fire alarm, Engine 1. Go ahead. Received." -> callType ignore.
             "Fire alarm to Engine 1, activated smoke detector at 12 Main Street" -> callType alarm.
             "Fire alarm to Rescue 3, patient having chest pain" -> callType medical.
+            Unit status updates (clearing/leaving the hospital, en route back, in quarters,
+            mileage or odometer readings, available) are routine chatter: callType ignore.
+            "Fire alarm, A2, off of CMC 20.6. On arrival, 20.6." -> callType ignore.
             Classification definitions (classify the event, not the agency or a radio salutation):
             welfare_check: welfare / well-being checks requested for someone's safety; not medical
             unless an actual medical complaint is stated.
@@ -132,7 +202,10 @@ public sealed class AddressExtractor(IHttpClientFactory clients, IConfiguration 
             lockout assistance, or another explicit request for practical help.
             For a fall with an explicit denial of injury and only assistance requested,
             use public_assistance, not welfare_check. A fall with injury is medical.
-            alarm: an activated alarm, smoke detector, or alarm investigation/reset, including
+            security_alarm: a police security/burglar/residential motion alarm; an alarm does not
+            prove a burglary occurred. With no channel context, infer police only when security
+            context is clear; do not infer fire from the word alarm alone.
+            alarm: a fire-service activated alarm, smoke detector, or alarm investigation/reset, including
             smoke from cooking; use fire only for a reported actual or suspected fire.
             An alarm sounding with evacuation is still alarm when no actual fire is reported.
             Alarm system reset, restored power, and a normal control panel are substantive alarm
@@ -169,14 +242,7 @@ public sealed class AddressExtractor(IHttpClientFactory clients, IConfiguration 
             """ + "\n" + LocationInstructions
                 .Replace("Return only JSON with these required fields:", "Location fields:")
                 .Replace("return null for every field", "return null for every location field");
-        // Normalize only radio-address syntax. Preserve descriptions such as
-        // "respond to a fire alarm at ..." so genuine alarm calls remain visible.
-        var modelText = Regex.Replace(text,
-            @"\bfire\s+alarm\b(?=\s+(?:to\s+(?:the\s+)?(?:all\s+companies|engine|rescue|medic|tower|ladder|battalion|companies|units)\b|answering\b|calling\b)|\s*,\s*(?:engine|rescue|medic|tower|ladder|battalion|all companies)\b)",
-            "Dispatch", RegexOptions.IgnoreCase);
-        modelText = Regex.Replace(modelText,
-            @"\b((?:engine|rescue|medic|tower|ladder|battalion)\s+\d+\s+to\s+)fire\s+alarm\b",
-            "$1Dispatch", RegexOptions.IgnoreCase);
+        var modelText = NormalizeRadioAddress(text);
         var input = $"Service context: {service ?? "unknown"}\nTransmission text:\n{modelText}";
         using var result = await GenerateAsync(instructions, input, schema, 768, cancellationToken);
         if (result.RootElement.ValueKind != JsonValueKind.Object || result.RootElement.EnumerateObject().Count() != properties.Count)
@@ -202,6 +268,10 @@ public sealed class AddressExtractor(IHttpClientFactory clients, IConfiguration 
         // including when the model inferred the fire service without supplied context.
         if (values["service"] == "fire" && values["callType"] == "welfare_check")
             values["callType"] = "public_assistance";
+        if (values["service"] == "police" && values["callType"] == "alarm")
+            values["callType"] = "security_alarm";
+        if (!AllowedCallTypes(values["service"]).Contains(values["callType"]))
+            values["callType"] = "other";
         return values;
     }
 
@@ -247,12 +317,19 @@ public sealed class AddressExtractor(IHttpClientFactory clients, IConfiguration 
     private async Task<JsonDocument> GenerateAsync(string system, string text, object schema,
         int maxTokens, CancellationToken cancellationToken)
     {
-        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        deadline.CancelAfter(TimeSpan.FromSeconds(config.GetValue("Address:TimeoutSeconds", 120)));
-        var ct = deadline.Token;
-        await gate.WaitAsync(ct);
+        // Calls are serialized (one local model). The per-call timeout starts once this
+        // call has its turn, so a burst of transmissions doesn't time out while queued;
+        // the queue wait has its own, longer bound.
+        using (var queued = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken))
+        {
+            queued.CancelAfter(TimeSpan.FromSeconds(Math.Clamp(config.GetValue("Address:QueueTimeoutSeconds", 300), 1, 3600)));
+            await gate.WaitAsync(queued.Token);
+        }
         try
         {
+            using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            deadline.CancelAfter(TimeSpan.FromSeconds(Math.Clamp(config.GetValue("Address:TimeoutSeconds", 120), 1, 600)));
+            var ct = deadline.Token;
             using var client = clients.CreateClient("address");
             var baseUri = new Uri(config["Address:OllamaUrl"] ?? "http://127.0.0.1:11434/");
             using var response = await client.PostAsJsonAsync(new Uri(baseUri, "/api/chat"), new

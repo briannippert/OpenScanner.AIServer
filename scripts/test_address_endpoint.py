@@ -43,6 +43,16 @@ class Backend(http.server.BaseHTTPRequestHandler):
             {'matchedAddress': '123 MAIN ST, NORTH CITY, VA', 'coordinates': {'x': -77.1, 'y': 38.9}}]
         if address == 'ambiguous':
             matches.append({'matchedAddress': '123 MAIN ST, SOUTH CITY, VA', 'coordinates': {'x': -77.2, 'y': 38.8}})
+        if address.startswith('16 Garabedian'):
+            matches[0]['matchedAddress'] = '16 GARABEDIAN DR, SALEM, NH, 03079'
+        if address.startswith('16 GarabedianWrong'):
+            matches[0]['matchedAddress'] = '16 GARABEDIAN DR, SALEM, NH, 03079'
+        if address.startswith(('8 Graymoor Woods', '9 Graymoor Woods', '8 N Graymoor Woods', '8 Elsewhere Woods')):
+            matches[0]['matchedAddress'] = '8 BRAEMOOR WOODS RD, SALEM, NH, 03079'
+        if address.startswith('18 Graymoor Woods'):
+            matches = [
+                {'matchedAddress': '18 BRAEMOOR WOODS RD, SALEM, NH, 03079', 'coordinates': {'x': -71.2, 'y': 42.7}},
+                {'matchedAddress': '18 BRAEMOR WOODS RD, SALEM, NH, 03079', 'coordinates': {'x': -71.21, 'y': 42.71}}]
         if address.startswith('44 Millville Street'):
             matches[0]['matchedAddress'] = '44 MILLVILLE ST, SALEM, NH, 03079'
         if address.startswith('294 N Broadway'):
@@ -69,6 +79,15 @@ class Backend(http.server.BaseHTTPRequestHandler):
         if not ranking and not transmission: assert data['format']['required']==fields
         text=data['messages'][-1]['content']
         if transmission:
+            agency = text.splitlines()[0].split(':', 1)[1].strip()
+            choices = data['format']['properties']['callType']['enum']
+            services = data['format']['properties']['service']['enum']
+            if agency == 'police':
+                assert 'alarm' not in choices and 'fire' not in choices and 'security_alarm' in choices
+                assert services == ['police', None]
+            if agency == 'fire':
+                assert 'security_alarm' not in choices and 'traffic_stop' not in choices and 'welfare_check' not in choices
+                assert services == ['fire', None]
             text = text.split('Transmission text:\n', 1)[1]
             if text == 'unavailable': self.send_error(503); return
             if text == 'timeout': time.sleep(2); return
@@ -86,6 +105,10 @@ class Backend(http.server.BaseHTTPRequestHandler):
                               houseNumber='9', street='Pine St', city='Concord', state='NH')
             if text.startswith('business '): result.update(callType='other', summary='Incident at a business.', placeName=text.removeprefix('business '))
             if text == 'welfare policy': result.update(callType='welfare_check', service='fire', summary='Check on a person.')
+            if text == 'alarm policy': result.update(callType='alarm', service='fire', summary='Residential motion alarm at 43 Woodmeadow Drive.', address='43 Woodmeadow Drive', houseNumber='43', street='Woodmeadow Drive')
+            if text == 'fire policy': result.update(callType='fire', service='fire', summary='Reported fire.')
+            if text == 'medical policy': result.update(callType='medical', service='fire', summary='Medical complaint.')
+            if text == 'security policy': result.update(callType='security_alarm', service='police', summary='Security alarm.')
             if text == 'bad-category': result.update(callType='invented', summary='Test')
             content = '{}' if text == 'invalid' else json.dumps(result)
             self.send_response(200); self.send_header('Content-Type', 'application/json'); self.end_headers()
@@ -99,7 +122,7 @@ class Backend(http.server.BaseHTTPRequestHandler):
             if selection['address'].startswith('Coffee Place'):
                 assert len(selection['candidates']) == 1
                 assert 'New Hampshire' in selection['candidates'][0]['address']
-            selected = 1 if context in ('South City', 'auto ambiguous South City') else (99 if context == 'bad-index' else (0 if context == 'business Coffee Place' else None))
+            selected = 0 if context == 'correction ambiguous' else 1 if context in ('South City', 'auto ambiguous South City') else (99 if context == 'bad-index' else (0 if context == 'business Coffee Place' else None))
             self.send_response(200); self.send_header('Content-Type', 'application/json'); self.end_headers()
             self.wfile.write(json.dumps({'done': True, 'message': {'content': json.dumps({'selectedMatchIndex': selected})}}).encode())
             return
@@ -110,6 +133,14 @@ class Backend(http.server.BaseHTTPRequestHandler):
         if text in ('guard invented place', 'Coffee Place at 44 Millville Street'):
             result.update(address='44 Millville Street', houseNumber='44', street='Millville Street',
                 placeName='Dollar Tree' if text == 'guard invented place' else 'Coffee Place')
+        if text == 'partial street': result.update(address='16 Garabedian', houseNumber='16', street='Garabedian')
+        if text == 'wrong partial street': result.update(address='16 GarabedianWrong', houseNumber='16', street='GarabedianWrong')
+        if text == 'wrong explicit suffix': result.update(address='16 Garabedian Street', houseNumber='16', street='Garabedian Street')
+        if text.startswith('correction '):
+            source_house = '9' if text == 'correction number' else ('18' if text == 'correction ambiguous' else '8')
+            source_street = {'correction suffix': 'Graymoor Woods Drive', 'correction direction': 'N Graymoor Woods',
+                             'correction unrelated': 'Elsewhere Woods'}.get(text, 'Graymoor Woods')
+            result.update(address=f'{source_house} {source_street}', houseNumber=source_house, street=source_street, unit='302')
         if text == 'guard place only': result['placeName'] = 'Dollar Tree'
         if text == 'guard wrong number': result.update(address='44 Mismatch Street', houseNumber='44', street='Mismatch Street')
         if text == 'guard wrong street': result.update(address='123 Mismatch Street', houseNumber='123', street='Mismatch Street')
@@ -148,8 +179,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_response(200); self.end_headers(); self.wfile.write(b'{"status":"ok"}')
     def do_POST(self):
         self.rfile.read(int(self.headers['Content-Length']))
+        text = Path(os.environ['MOCK_TRANSCRIPT_FILE']).read_text()
+        if text == '__CRASH__': os._exit(1)
+        if text == '__HTTP500__':
+            self.send_response(500); self.end_headers(); self.wfile.write(b'boom'); return
         self.send_response(200); self.send_header('Content-Type','application/json'); self.end_headers()
-        self.wfile.write(json.dumps({'text':Path(os.environ['MOCK_TRANSCRIPT_FILE']).read_text()}).encode())
+        self.wfile.write(json.dumps({'text':text}).encode())
 http.server.HTTPServer(('127.0.0.1',port),Handler).serve_forever()
 ''')
 whisper.chmod(0o755)
@@ -221,8 +256,17 @@ with tempfile.TemporaryFile(mode='w+') as log:
         assert transmission('welfare policy', 'fire')[1]['callType'] == 'public_assistance'
         assert transmission('welfare policy', 'police')[1]['callType'] == 'welfare_check'
         assert transmission('welfare policy')[1]['callType'] == 'public_assistance'
+        result = transmission('alarm policy', 'police')[1]
+        assert result['service'] == 'police' and result['callType'] == 'security_alarm'
+        assert result['location']['houseNumber'] == '43'
+        assert transmission('alarm policy', 'fire')[1]['callType'] == 'alarm'
+        assert transmission('security policy', 'fire')[1]['callType'] == 'other'
+        assert transmission('fire policy', 'police')[1]['callType'] == 'other'
+        assert transmission('medical policy', 'police')[1]['callType'] == 'other'
+        assert transmission('medical policy', 'fire')[1]['callType'] == 'medical'
+        assert transmission('traffic stop', 'police')[1]['callType'] == 'traffic_stop'
         status, value = transmission('traffic stop', ' FIRE ')
-        assert status == 200 and value['service'] == 'fire' and value['callType'] == 'traffic_stop'
+        assert status == 200 and value['service'] == 'fire' and value['callType'] == 'other'
         assert value['location']['houseNumber'] == '123' and value['location']['geocode']['latitude'] == 38.9
         status, value = transmission('medical')
         assert status == 200 and value['callType'] == 'medical' and value['service'] is None
@@ -273,6 +317,19 @@ with tempfile.TemporaryFile(mode='w+') as log:
         assert transcribe('copy', includeMetadata='maybe')[0] == 400
         assert transcribe('copy', service='ems')[0] == 400
         assert transcribe('copy', defaultCity='x'*101)[0] == 400
+        # Failures must be distinguishable from silence, never a 200 with empty text.
+        assert transcribe('copy', model='not-installed')[0] == 400
+        assert transcribe('copy', model='../escape')[0] == 400
+        status, result = transcribe('__HTTP500__')
+        assert status == 502 and 'error' in result, (status, result)
+        # A crashed whisper-server child is replaced on the next request.
+        status, result = transcribe('__CRASH__')
+        assert status == 502 and 'error' in result, (status, result)
+        assert transcribe('traffic stop') == (200, {'text':'traffic stop'})
+        # Blank service means "not supplied" on every endpoint.
+        assert transcribe('copy', service='')[0] == 200
+        assert request({'text': 'copy', 'service': ''}, '/transmission')[0] == 200
+        print('PASS: whisper model/inference failures, crash recovery, and blank service handling')
         print('PASS: request locality precedence/isolation, optional audio metadata, text preservation, validation and failures')
         def geocode(address, context=None):
             return request({'address': address, 'context': context}, '/geocode')
@@ -343,6 +400,23 @@ with tempfile.TemporaryFile(mode='w+') as log:
             status, result = request({'text': text})
             assert status == 200 and result['geocode'] is None
             assert result['address'].endswith('Mismatch Street')
+        status, result = request({'text': 'partial street'})
+        assert status == 200 and result['street'] == 'Garabedian'
+        assert result['geocode']['matchedAddress'] == '16 GARABEDIAN DR, SALEM, NH, 03079'
+        for text in ['wrong partial street', 'wrong explicit suffix']:
+            status, result = request({'text': text})
+            assert status == 200 and result['geocode'] is None
+        status, result = request({'text': 'correction valid'})
+        assert status == 200 and result['address'] == '8 Graymoor Woods' and result['unit'] == '302'
+        assert result['geocode']['matchedAddress'] == '8 BRAEMOOR WOODS RD, SALEM, NH, 03079'
+        for text in ['correction number', 'correction suffix', 'correction direction', 'correction unrelated', 'correction ambiguous']:
+            status, result = request({'text': text})
+            assert status == 200 and result['geocode'] is None, (text, result)
+        for defaults in [{'defaultCity': 'Concord'}, {'defaultState': 'MA'}]:
+            status, result = request({'text': 'correction valid'} | defaults)
+            assert status == 200 and result['geocode'] is None, result
+        print('PASS: combined street-name/suffix correction preserves number, locality, direction, explicit suffix and ambiguity checks')
+        print('PASS: omitted street suffix accepted without changing a supplied suffix or street name')
         print('PASS: invented business rejection, explicit street precedence, and mismatched number/street rejection')
         print('PASS: 10 endpoint checks (validation, extraction, no address, invalid/truncated JSON, backend failure, timeout)')
     finally: app.terminate(); app.wait(timeout=10); backend.shutdown(); backend.server_close(); assets.cleanup()
