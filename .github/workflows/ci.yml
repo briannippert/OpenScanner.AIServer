@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: Build and offline tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      # whisper.cpp is not needed: the integration tests run against a mock
+      # whisper-server, mock Ollama and mock geocoding providers.
+      - uses: actions/checkout@v5
+        with:
+          submodules: false
+
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.x
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Restore
+        run: dotnet restore
+
+      # The test scripts launch bin/Debug/net10.0/OpenScanner.AIServer.dll.
+      - name: Build
+        run: dotnet build --no-restore --configuration Debug -p:WarningsAsErrors=nullable
+
+      - name: Check shell script syntax
+        run: for f in scripts/*.sh; do bash -n "$f"; done
+
+      - name: Endpoint, transcription and geocoding tests
+        run: python3 scripts/test_address_endpoint.py
+        timeout-minutes: 10
+
+      - name: Street fallback tests
+        run: python3 scripts/test_street_fallback.py
+        timeout-minutes: 10
+
+      - name: Ollama setup tests
+        run: python3 scripts/test_ollama_setup.py
+        timeout-minutes: 5

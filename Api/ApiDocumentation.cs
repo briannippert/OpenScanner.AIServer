@@ -1,8 +1,8 @@
 using Microsoft.OpenApi;
-using OpenScanner.WhisperServer.Services;
+using OpenScanner.AIServer.Services;
 using Swashbuckle.AspNetCore.SwaggerGen;
 
-namespace OpenScanner.WhisperServer.Api;
+namespace OpenScanner.AIServer.Api;
 
 public sealed record ApiError(string Error);
 public sealed record TranscriptionResponse(string Text);

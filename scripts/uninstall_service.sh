@@ -2,7 +2,7 @@
 set -e
 
 # =====================================================
-# OpenScanner WhisperServer Uninstaller
+# OpenScanner AI Server Uninstaller
 # =====================================================
 
 RED='\033[0;31m'
@@ -20,25 +20,28 @@ if [ "$EUID" -eq 0 ]; then
   exit 1
 fi
 
-log_step "Stopping service..."
-if systemctl is-active --quiet openscanner-whisper; then
-    sudo systemctl stop openscanner-whisper
-    log_info "Service stopped."
-fi
-
-log_step "Disabling service..."
-if systemctl is-enabled --quiet openscanner-whisper 2>/dev/null; then
-    sudo systemctl disable openscanner-whisper
-    log_info "Service disabled."
-fi
-
-log_step "Removing service file..."
-if [ -f /etc/systemd/system/openscanner-whisper.service ]; then
-    sudo rm /etc/systemd/system/openscanner-whisper.service
+# openscanner-whisper is the unit name used before the rename to OpenScanner.AIServer.
+REMOVED=false
+for unit in openscanner-ai openscanner-whisper; do
+    log_step "Removing $unit..."
+    if systemctl is-active --quiet "$unit"; then
+        sudo systemctl stop "$unit"
+        log_info "Service stopped."
+    fi
+    if systemctl is-enabled --quiet "$unit" 2>/dev/null; then
+        sudo systemctl disable "$unit"
+        log_info "Service disabled."
+    fi
+    if [ -f "/etc/systemd/system/$unit.service" ]; then
+        sudo rm "/etc/systemd/system/$unit.service"
+        REMOVED=true
+        log_info "Service file removed."
+    fi
+done
+if [ "$REMOVED" = true ]; then
     sudo systemctl daemon-reload
-    log_info "Service file removed."
 fi
 
 echo ""
-log_success "OpenScanner WhisperServer service uninstalled."
+log_success "OpenScanner AI Server service uninstalled."
 log_info "Project files have not been removed. Delete manually if desired."

@@ -1,7 +1,7 @@
-using OpenScanner.WhisperServer.Api;
+using OpenScanner.AIServer.Api;
 using System.Text.RegularExpressions;
 
-namespace OpenScanner.WhisperServer.Services;
+namespace OpenScanner.AIServer.Services;
 
 public sealed class LocationEnricher(GeocodeResolver resolver, PlaceGeocoder places, StreetGeocoder streets, ILogger<LocationEnricher> logger)
 {
@@ -69,7 +69,8 @@ public sealed class LocationEnricher(GeocodeResolver resolver, PlaceGeocoder pla
                 }
                 geocode ??= resolved.SelectedMatch;
                 if (geocode is not null && !string.IsNullOrWhiteSpace(fields["houseNumber"]) &&
-                    !MatchesNumberedAddress(fields["houseNumber"]!, fields["street"], geocode))
+                    !MatchesNumberedAddress(fields["houseNumber"]!, fields["street"], geocode,
+                        city, state, resolved.Matches.Count <= 1))
                 {
                     geocode = null;
                     logger.LogWarning("Discarded a geocode conflicting with the extracted numbered street");
@@ -108,14 +109,25 @@ public sealed class LocationEnricher(GeocodeResolver resolver, PlaceGeocoder pla
             RegexOptions.IgnoreCase);
     }
 
-    private static bool MatchesNumberedAddress(string house, string? street, GeocodeMatch match)
+    private static bool MatchesNumberedAddress(string house, string? street, GeocodeMatch match,
+        string city, string state, bool uniqueCandidate)
     {
-        var firstLine = match.MatchedAddress.Split(',')[0].Trim();
+        var parts = match.MatchedAddress.Split(',').Select(p => p.Trim()).ToArray();
+        var firstLine = parts[0];
         var parsed = Regex.Match(firstLine, @"^(?<house>\d+[A-Za-z]?(?:-\d+)?)\s+(?<street>.+)$");
         var matchedHouse = match.HouseNumber ?? (parsed.Success ? parsed.Groups["house"].Value : null);
         if (!string.Equals(house.Trim(), matchedHouse?.Trim(), StringComparison.OrdinalIgnoreCase)) return false;
+        if (parsed.Success && !string.Equals(house.Trim(), parsed.Groups["house"].Value, StringComparison.OrdinalIgnoreCase)) return false;
         if (string.IsNullOrWhiteSpace(street)) return true;
         var matchedStreet = match.Street ?? (parsed.Success ? parsed.Groups["street"].Value : null);
-        return matchedStreet is not null && StreetGeocoder.Similar(street, matchedStreet);
+        if (matchedStreet is null) return false;
+        if (StreetGeocoder.SameStreet(street, matchedStreet)) return true;
+        if (!uniqueCandidate || !StreetGeocoder.Similar(street, matchedStreet)) return false;
+        // A corrected name/suffix needs a unique provider result in the requested
+        // locality, not simply a close string or the model's preferred candidate.
+        var matchedCity = match.City ?? (parts.Length >= 3 ? parts[1] : null);
+        var matchedState = match.State ?? (parts.Length >= 3 ? parts[2] : null);
+        return string.Equals(city.Trim(), matchedCity?.Trim(), StringComparison.OrdinalIgnoreCase) &&
+            matchedState is not null && Geo.StateCode(state).Equals(Geo.StateCode(matchedState), StringComparison.OrdinalIgnoreCase);
     }
 }

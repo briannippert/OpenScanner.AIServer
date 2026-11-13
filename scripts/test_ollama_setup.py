@@ -79,6 +79,7 @@ from pathlib import Path
 root=Path(os.environ['MOCK_ROOT'])
 with (root/'commands.jsonl').open('a') as f:f.write(json.dumps(['systemctl']+sys.argv[1:])+'\\n')
 if sys.argv[1:3]==['cat','ollama.service'] and os.environ.get('MOCK_MISSING_SERVICE')=='1':raise SystemExit(1)
+if sys.argv[1:2]==['is-active'] and sys.argv[-1] in os.environ.get('MOCK_INACTIVE','').split(','):raise SystemExit(3)
 if sys.argv[1:3]==['restart','ollama'] and os.environ.get('MOCK_RESTART_FAIL')=='1':raise SystemExit(1)
 ''')
         self.command('sudo', '''
@@ -211,9 +212,27 @@ setup_ollama "$2" "$3" "$4" "$5"
             '--port=8099', '--llm-model=qwen3:4b'], env=self.env, input='\n', text=True,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=20)
         self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn(['systemctl', 'stop', 'openscanner-ai'], self.commands())
+        self.assertIn(['systemctl', 'start', 'openscanner-ai'], self.commands())
+        # Only one unit is restored, so the old and new services never compete for the port.
+        self.assertNotIn(['systemctl', 'start', 'openscanner-whisper'], self.commands())
+        self.assertIn('Configuration was not saved', result.stdout)
+
+    def test_installer_restores_legacy_service_after_setup_failure(self):
+        # An install from before the OpenScanner.AIServer rename runs openscanner-whisper.
+        project = self.root/'project'
+        (project/'scripts').mkdir(parents=True)
+        for name in ['install_service.sh', 'setup_ollama.sh']:
+            shutil.copy(ROOT/'scripts'/name, project/'scripts'/name)
+        shutil.copy(self.config, project/'appsettings.json')
+        self.bad_json = True
+        result = subprocess.run(['bash', str(project/'scripts/install_service.sh'), '--skip-update',
+            '--port=8099', '--llm-model=qwen3:4b'], env=dict(self.env, MOCK_INACTIVE='openscanner-ai'),
+            input='\n', text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=20)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertIn(['systemctl', 'stop', 'openscanner-whisper'], self.commands())
         self.assertIn(['systemctl', 'start', 'openscanner-whisper'], self.commands())
-        self.assertIn('Configuration was not saved', result.stdout)
+        self.assertNotIn(['systemctl', 'start', 'openscanner-ai'], self.commands())
 
     def test_help_and_conflicting_skip_flags(self):
         help_result = subprocess.run(['bash', str(ROOT/'scripts/install_service.sh'), '--help'], capture_output=True, text=True)

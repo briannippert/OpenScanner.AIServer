@@ -27,6 +27,7 @@ for text, call_type in [
     assert result['callType'] == call_type, result
     assert result['location']['placeName'] is None, result
 assert extract('Fire alarm, Engine 1. Go ahead. Received.') == {}
+assert extract('Fire alarm, A2, off of CMC 20.6. On arrival, 20.6.') == {}
 result = extract("Engine 1. Engine 1, it's a 74-year-old female. She's located inside Market Basket. She's feeling faint. She has a history of fib. Engine 1, edit it, thank you.")
 assert result['callType'] == 'medical' and result['location']['placeName'] == 'Market Basket'
 result = extract('Engine 1, respond for a welfare check; the caller requests help opening a door, no medical complaint reported.')

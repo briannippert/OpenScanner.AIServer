@@ -5,7 +5,7 @@ using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 
-namespace OpenScanner.WhisperServer.Services;
+namespace OpenScanner.AIServer.Services;
 
 /// <summary>
 /// Manages a set of long-lived <c>whisper-server</c> child processes so models stay
@@ -27,6 +27,7 @@ public sealed class WhisperServerPool : IHostedService, IDisposable
     private readonly HashSet<int> _usedPorts = new();
     private readonly SemaphoreSlim _evictLock = new(1, 1);
     private readonly Lazy<HardwareInfo> _hardwareInfo;
+    private readonly CancellationTokenSource _stopping = new();
     private volatile bool _disposed;
 
     public WhisperServerPool(ILogger<WhisperServerPool> logger, IHttpClientFactory httpClientFactory, IConfiguration config)
@@ -93,7 +94,7 @@ public sealed class WhisperServerPool : IHostedService, IDisposable
         }
     }
 
-    public IReadOnlyList<string> LoadedModels() => _pools.Keys.ToList();
+    public IReadOnlyList<string> LoadedModels() => _pools.Values.Where(p => p.Ready).Select(p => p.Model).ToList();
 
     // ---- Lifecycle --------------------------------------------------------
 
@@ -107,7 +108,11 @@ public sealed class WhisperServerPool : IHostedService, IDisposable
         // Pre-warm the default model so the first transmission isn't blocked on a cold load.
         if (DefaultModelExists)
         {
-            try { await GetInstanceAsync(DefaultModel, cancellationToken); }
+            try
+            {
+                var instance = await AcquireAsync(DefaultModel, cancellationToken);
+                await ReleaseAsync(instance);
+            }
             catch (Exception ex) { _logger.LogWarning(ex, "Failed to pre-warm default model '{Model}'", DefaultModel); }
         }
         else
@@ -124,22 +129,21 @@ public sealed class WhisperServerPool : IHostedService, IDisposable
 
     // ---- Transcription ----------------------------------------------------
 
+    /// <summary>
+    /// Transcribes a WAV file. Returns null only for genuinely empty/blank audio.
+    /// Throws <see cref="WhisperModelException"/> for an invalid or uninstalled model and
+    /// <see cref="WhisperInferenceException"/> when whisper-server fails, so callers can
+    /// distinguish a failure from silence.
+    /// </summary>
     public async Task<string?> TranscribeAsync(string wavPath, string? model, string? prompt, CancellationToken ct = default)
     {
         var modelName = string.IsNullOrWhiteSpace(model) ? DefaultModel : model!;
         if (!IsValidModelName(modelName))
-        {
-            _logger.LogError("Invalid model name '{Model}'; refusing to use it.", SafeForLog(modelName));
-            return null;
-        }
+            throw new WhisperModelException($"Invalid model name '{SafeForLog(modelName)}'.");
         if (!File.Exists(ModelPath(modelName)))
-        {
-            _logger.LogError("Model '{Model}' not installed at {Path}", SafeForLog(modelName), ModelPath(modelName));
-            return null;
-        }
+            throw new WhisperModelException($"Model '{modelName}' is not installed.");
 
-        var instance = await GetInstanceAsync(modelName, ct);
-        Interlocked.Increment(ref instance.InFlight);
+        var instance = await AcquireAsync(modelName, ct);
         try
         {
             using var content = new MultipartFormDataContent();
@@ -159,67 +163,115 @@ public sealed class WhisperServerPool : IHostedService, IDisposable
             using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             timeoutCts.CancelAfter(InferenceTimeoutMs);
 
-            using var resp = await client.PostAsync($"http://127.0.0.1:{instance.Port}/inference", content, timeoutCts.Token);
-            if (!resp.IsSuccessStatusCode)
+            HttpResponseMessage resp;
+            try
             {
-                var body = await resp.Content.ReadAsStringAsync(ct);
-                _logger.LogError("Inference failed on {Model} (HTTP {Code}): {Body}", SafeForLog(modelName), (int)resp.StatusCode, body);
-                return null;
+                resp = await client.PostAsync($"http://127.0.0.1:{instance.Port}/inference", content, timeoutCts.Token);
             }
+            catch (HttpRequestException ex)
+            {
+                // Usually the child died mid-request; the next acquire will replace it.
+                throw new WhisperInferenceException($"whisper-server for '{modelName}' is unreachable: {ex.Message}", ex);
+            }
+            using (resp)
+            {
+                if (!resp.IsSuccessStatusCode)
+                {
+                    var body = await resp.Content.ReadAsStringAsync(timeoutCts.Token);
+                    _logger.LogError("Inference failed on {Model} (HTTP {Code}): {Body}", SafeForLog(modelName), (int)resp.StatusCode, body);
+                    throw new WhisperInferenceException($"whisper-server returned HTTP {(int)resp.StatusCode}.");
+                }
 
-            var json = await resp.Content.ReadFromJsonAsync<JsonElement>(cancellationToken: ct);
-            var text = json.TryGetProperty("text", out var t) ? t.GetString()?.Trim() : null;
+                JsonElement json;
+                try { json = await resp.Content.ReadFromJsonAsync<JsonElement>(cancellationToken: timeoutCts.Token); }
+                catch (JsonException ex) { throw new WhisperInferenceException("whisper-server returned invalid JSON.", ex); }
+                var text = json.ValueKind == JsonValueKind.Object && json.TryGetProperty("text", out var t) &&
+                    t.ValueKind == JsonValueKind.String ? t.GetString()?.Trim() : null;
 
-            if (string.IsNullOrEmpty(text)) return null;
-            // whisper emits [BLANK_AUDIO] / [ ... ] on silence.
-            if (text.StartsWith('[') && text.EndsWith(']')) return null;
-            return text;
+                if (string.IsNullOrEmpty(text)) return null;
+                // whisper emits [BLANK_AUDIO] / [ ... ] on silence.
+                if (text.StartsWith('[') && text.EndsWith(']')) return null;
+                return text;
+            }
         }
         finally
         {
-            Interlocked.Decrement(ref instance.InFlight);
-            instance.Owner.Touch();
+            await ReleaseAsync(instance);
         }
     }
 
     // ---- Instance management ---------------------------------------------
 
-    private async Task<WhisperInstance> GetInstanceAsync(string model, CancellationToken ct)
+    /// <summary>
+    /// Returns a live instance with its in-flight count already incremented. Retries when
+    /// the pool was evicted or an instance died between lookup and acquisition.
+    /// </summary>
+    private async Task<WhisperInstance> AcquireAsync(string model, CancellationToken ct)
     {
-        var pool = _pools.GetOrAdd(model, m => new ModelPool(m));
-
-        if (!pool.Ready)
+        for (var attempt = 0; ; attempt++)
         {
-            await pool.InitLock.WaitAsync(ct);
-            try
-            {
-                if (!pool.Ready)
-                {
-                    await StartPoolAsync(pool, ct);
-                    pool.Ready = true;
-                    await EnforceResidentLimitAsync(keep: model);
-                }
-            }
-            finally
-            {
-                pool.InitLock.Release();
-            }
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            var pool = _pools.GetOrAdd(model, m => new ModelPool(m));
+            // The load runs on the service lifetime token: a client that gives up during a
+            // cold model load stops waiting, but the load completes for the next request.
+            await EnsureStartedAsync(pool).WaitAsync(ct);
+            if (pool.TryAcquire(out var instance)) return instance;
+            if (attempt >= 3)
+                throw new WhisperInferenceException($"whisper-server for '{model}' keeps exiting; see service logs.");
+            await Task.Delay(100 * (attempt + 1), ct);
         }
+    }
 
-        pool.Touch();
-        return pool.Next();
+    private async Task ReleaseAsync(WhisperInstance instance)
+    {
+        Interlocked.Decrement(ref instance.InFlight);
+        // An eviction may have been deferred while this request was running. Recency is
+        // by request start (TryAcquire), so finishing a slow request on an old model
+        // doesn't evict a model that was requested more recently.
+        try { await EnforceResidentLimitAsync(keep: null); }
+        catch (Exception ex) { _logger.LogWarning(ex, "Deferred model eviction failed"); }
+    }
+
+    /// <summary>
+    /// Returns the pool's start task, (re)starting it when it has never started, failed,
+    /// or lost instances to a crash. Dead instances are removed so they are never routed to.
+    /// </summary>
+    private Task EnsureStartedAsync(ModelPool pool)
+    {
+        lock (pool.Sync)
+        {
+            if (pool.Evicted) return Task.CompletedTask; // TryAcquire fails; the caller retries on a fresh pool
+            var task = pool.StartTask;
+            if (task is { IsCompleted: false }) return task;
+            if (task is { IsCompletedSuccessfully: true })
+            {
+                var dead = pool.Instances.Where(i => i.Process.HasExited).ToArray();
+                if (dead.Length == 0) return task;
+                foreach (var inst in dead)
+                {
+                    _logger.LogError("whisper-server '{Model}' on port {Port} exited unexpectedly (exit code {Code}); restarting. Last output:\n{Tail}",
+                        pool.Model, inst.Port, SafeExitCode(inst.Process), inst.StderrTail());
+                    DisposeInstance(inst);
+                }
+                pool.Instances = pool.Instances.Except(dead).ToArray();
+            }
+            pool.StartTask = StartPoolAsync(pool, _stopping.Token);
+            return pool.StartTask;
+        }
     }
 
     private async Task StartPoolAsync(ModelPool pool, CancellationToken ct)
     {
+        await Task.Yield(); // never run the start inline under pool.Sync
         var modelPath = ModelPath(pool.Model);
+        var missing = InstancesPerModel - pool.Instances.Length;
         _logger.LogInformation("Starting {Count} whisper-server instance(s) for model '{Model}' ({ModelPath})",
-            InstancesPerModel, pool.Model, modelPath);
+            missing, pool.Model, modelPath);
 
         var started = new List<WhisperInstance>();
         try
         {
-            for (int i = 0; i < InstancesPerModel; i++)
+            for (int i = 0; i < missing; i++)
             {
                 var port = AllocatePort();
                 var psi = new ProcessStartInfo(WhisperServerBinary)
@@ -248,15 +300,13 @@ public sealed class WhisperServerPool : IHostedService, IDisposable
                 }
 
                 var instance = new WhisperInstance(proc, port, pool);
-                // Capture the child's stderr (bounded) so a startup failure is diagnosable;
+                // Capture the child's stderr (bounded) so a failure is diagnosable;
                 // drain stdout so the pipe can't fill and block the child.
                 proc.ErrorDataReceived += (_, e) => { if (e.Data != null) instance.AppendStderr(e.Data); };
                 proc.OutputDataReceived += (_, _) => { };
                 proc.BeginErrorReadLine();
                 proc.BeginOutputReadLine();
-
                 started.Add(instance);
-                pool.Instances.Add(instance);
 
                 await WaitForHealthAsync(instance, ct);
                 _logger.LogInformation("whisper-server '{Model}' ready on port {Port} (pid {Pid})", pool.Model, port, proc.Id);
@@ -264,18 +314,22 @@ public sealed class WhisperServerPool : IHostedService, IDisposable
         }
         catch
         {
-            // Roll back everything started in this call so we don't leak ports/processes
-            // or leave dead instances in the pool for the round-robin to hand out.
-            foreach (var inst in started)
-            {
-                pool.Instances.Remove(inst);
-                try { if (!inst.Process.HasExited) inst.Process.Kill(entireProcessTree: true); }
-                catch { /* already gone */ }
-                FreePort(inst.Port);
-                inst.Process.Dispose();
-            }
+            // Roll back everything started in this call so we don't leak ports/processes.
+            foreach (var inst in started) DisposeInstance(inst);
             throw;
         }
+
+        lock (pool.Sync)
+        {
+            if (pool.Evicted || _disposed)
+            {
+                foreach (var inst in started) DisposeInstance(inst);
+                return;
+            }
+            pool.Instances = [.. pool.Instances, .. started];
+            pool.Ready = true;
+        }
+        await EnforceResidentLimitAsync(keep: pool.Model);
     }
 
     private async Task WaitForHealthAsync(WhisperInstance instance, CancellationToken ct)
@@ -303,7 +357,7 @@ public sealed class WhisperServerPool : IHostedService, IDisposable
                 using var resp = await client.GetAsync($"http://127.0.0.1:{port}/health", ct);
                 if (resp.IsSuccessStatusCode) return;
             }
-            catch { /* connection refused while still booting — expected */ }
+            catch (HttpRequestException) { /* connection refused while still booting — expected */ }
 
             await Task.Delay(500, ct);
         }
@@ -312,25 +366,27 @@ public sealed class WhisperServerPool : IHostedService, IDisposable
             $"Last output:\n{instance.StderrTail()}");
     }
 
-    private async Task EnforceResidentLimitAsync(string keep)
+    private async Task EnforceResidentLimitAsync(string? keep)
     {
-        if (_pools.Count <= MaxResidentModels) return;
+        if (_pools.Values.Count(p => p.Ready) <= MaxResidentModels) return;
         await _evictLock.WaitAsync();
         try
         {
-            while (_pools.Count > MaxResidentModels)
+            while (_pools.Values.Count(p => p.Ready) > MaxResidentModels)
             {
-                // Evict the least-recently-used ready pool that isn't the one we just created.
-                var victim = _pools.Values
+                // Evict the least-recently-used idle pool that isn't the one being kept.
+                // A pool with requests in flight is skipped; ReleaseAsync retries later.
+                ModelPool? victim = null;
+                foreach (var candidate in _pools.Values
                     .Where(p => p.Ready && !string.Equals(p.Model, keep, StringComparison.OrdinalIgnoreCase))
-                    .OrderBy(p => p.LastUsedTicks)
-                    .FirstOrDefault();
-                if (victim == null) break;
-                if (_pools.TryRemove(victim.Model, out _))
+                    .OrderBy(p => p.LastUsedTicks))
                 {
-                    _logger.LogInformation("Evicting model '{Model}' to stay within {Max} resident models", victim.Model, MaxResidentModels);
-                    KillPool(victim);
+                    if (candidate.TryMarkEvicted()) { victim = candidate; break; }
                 }
+                if (victim == null) break;
+                _pools.TryRemove(new KeyValuePair<string, ModelPool>(victim.Model, victim));
+                _logger.LogInformation("Evicting model '{Model}' to stay within {Max} resident models", victim.Model, MaxResidentModels);
+                KillPool(victim);
             }
         }
         finally
@@ -356,15 +412,28 @@ public sealed class WhisperServerPool : IHostedService, IDisposable
         lock (_portLock) { _usedPorts.Remove(port); }
     }
 
+    private void DisposeInstance(WhisperInstance inst)
+    {
+        try { if (!inst.Process.HasExited) inst.Process.Kill(entireProcessTree: true); }
+        catch (Exception ex) { _logger.LogWarning(ex, "Failed to kill whisper-server on port {Port}", inst.Port); }
+        finally { FreePort(inst.Port); inst.Process.Dispose(); }
+    }
+
     private void KillPool(ModelPool pool)
     {
-        foreach (var inst in pool.Instances)
+        WhisperInstance[] instances;
+        lock (pool.Sync)
         {
-            try { if (!inst.Process.HasExited) inst.Process.Kill(entireProcessTree: true); }
-            catch (Exception ex) { _logger.LogWarning(ex, "Failed to kill whisper-server pid {Pid}", inst.Process.Id); }
-            finally { FreePort(inst.Port); inst.Process.Dispose(); }
+            instances = pool.Instances;
+            pool.Instances = [];
+            pool.Ready = false;
         }
-        pool.Instances.Clear();
+        foreach (var inst in instances) DisposeInstance(inst);
+    }
+
+    private static string SafeExitCode(Process process)
+    {
+        try { return process.ExitCode.ToString(); } catch { return "unknown"; }
     }
 
     // ---- Hardware detection (reused by /health) ---------------------------
@@ -384,8 +453,16 @@ public sealed class WhisperServerPool : IHostedService, IDisposable
             using var proc = Process.Start(psi);
             if (proc != null)
             {
-                var output = proc.StandardOutput.ReadToEnd().Trim();
-                proc.WaitForExit(3000);
+                // Bound the whole probe: a hung driver must not hang /health.
+                var stdout = proc.StandardOutput.ReadToEndAsync();
+                _ = proc.StandardError.ReadToEndAsync();
+                if (!proc.WaitForExit(3000) || !stdout.Wait(1000))
+                {
+                    try { proc.Kill(entireProcessTree: true); } catch { }
+                    _logger.LogWarning("nvidia-smi did not respond within 3s; reporting CPU only");
+                    return info;
+                }
+                var output = stdout.Result.Trim();
                 if (proc.ExitCode == 0 && !string.IsNullOrEmpty(output))
                 {
                     var parts = output.Split(',', 2);
@@ -425,8 +502,10 @@ public sealed class WhisperServerPool : IHostedService, IDisposable
     {
         if (_disposed) return;
         _disposed = true;
+        _stopping.Cancel();
         foreach (var pool in _pools.Values) KillPool(pool);
         _pools.Clear();
+        // _stopping is intentionally not disposed: an in-progress load may still observe its token.
     }
 
     // ---- Nested types -----------------------------------------------------
@@ -434,9 +513,13 @@ public sealed class WhisperServerPool : IHostedService, IDisposable
     private sealed class ModelPool
     {
         public string Model { get; }
-        public SemaphoreSlim InitLock { get; } = new(1, 1);
-        public List<WhisperInstance> Instances { get; } = new();
+        /// <summary>Guards Instances, StartTask, Evicted and in-flight acquisition.</summary>
+        public object Sync { get; } = new();
+        // Replaced (never mutated) under Sync so readers always see a consistent array.
+        public volatile WhisperInstance[] Instances = [];
+        public Task? StartTask;
         public volatile bool Ready;
+        public bool Evicted;
         private long _lastUsedTicks = DateTime.UtcNow.Ticks;
         private int _rr = -1;
 
@@ -445,13 +528,32 @@ public sealed class WhisperServerPool : IHostedService, IDisposable
         public long LastUsedTicks => Interlocked.Read(ref _lastUsedTicks);
         public void Touch() => Interlocked.Exchange(ref _lastUsedTicks, DateTime.UtcNow.Ticks);
 
-        // Prefer an idle instance; otherwise round-robin.
-        public WhisperInstance Next()
+        /// <summary>Picks a live instance (idle first, else round-robin) and marks it in flight.</summary>
+        public bool TryAcquire(out WhisperInstance instance)
         {
-            var idle = Instances.FirstOrDefault(i => Volatile.Read(ref i.InFlight) == 0);
-            if (idle != null) return idle;
-            var idx = Interlocked.Increment(ref _rr);
-            return Instances[(idx & int.MaxValue) % Instances.Count];
+            lock (Sync)
+            {
+                instance = null!;
+                if (Evicted) return false;
+                var live = Instances.Where(i => !i.Process.HasExited).ToArray();
+                if (live.Length == 0 || live.Length < Instances.Length) return false; // let EnsureStarted replace the dead
+                instance = live.FirstOrDefault(i => Volatile.Read(ref i.InFlight) == 0)
+                    ?? live[(Interlocked.Increment(ref _rr) & int.MaxValue) % live.Length];
+                Interlocked.Increment(ref instance.InFlight);
+                Touch();
+                return true;
+            }
+        }
+
+        /// <summary>Marks the pool evicted only if no request is using it.</summary>
+        public bool TryMarkEvicted()
+        {
+            lock (Sync)
+            {
+                if (Evicted || Instances.Any(i => Volatile.Read(ref i.InFlight) > 0)) return false;
+                Evicted = true;
+                return true;
+            }
         }
     }
 
@@ -488,6 +590,12 @@ public sealed class WhisperServerPool : IHostedService, IDisposable
         }
     }
 }
+
+/// <summary>The requested model name is invalid or not installed (client error).</summary>
+public sealed class WhisperModelException(string message) : Exception(message);
+
+/// <summary>whisper-server failed or returned an unusable response (upstream error).</summary>
+public sealed class WhisperInferenceException(string message, Exception? inner = null) : Exception(message, inner);
 
 public class HardwareInfo
 {
