@@ -9,7 +9,7 @@ public sealed record TranscriptionResponse(string Text);
 public sealed record TranscriptionWithMetadataResponse(string Text, object? Metadata, string? MetadataError);
 public sealed record ModelInfo(string Id, string Label);
 public sealed record ModelsResponse(IReadOnlyList<ModelInfo> Models);
-public sealed record HealthResponse(string Status, string DefaultModel, bool BinaryFound,
+public sealed record HealthResponse(string Status, string Version, string DefaultModel, bool BinaryFound,
     bool DefaultModelFound, IReadOnlyList<string> LoadedModels, string Acceleration,
     string Cpu, string? Gpu, int? GpuMemoryMb);
 public sealed record AddressResponse(string? Address, string? HouseNumber, string? Street,

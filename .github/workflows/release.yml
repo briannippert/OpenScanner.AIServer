@@ -1,0 +1,107 @@
+name: Release
+
+# Manual only: Actions → Release → "Run workflow". Builds the release artifacts
+# that install.sh installs, and publishes them as a GitHub release tagged
+# v<version> (version comes from Nerdbank.GitVersioning).
+#
+# Run it from main for a real release. Run from any other branch and the result
+# is marked as a pre-release, which installs ignore (they follow releases/latest),
+# so the pipeline can be tried out safely.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build (${{ matrix.rid }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          # Ubuntu 22.04 on purpose: its older glibc keeps the prebuilt
+          # whisper-server runnable on Debian 12 and other current distros.
+          - rid: linux-x64
+            runner: ubuntu-22.04
+          - rid: linux-arm64
+            runner: ubuntu-22.04-arm
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0 # Nerdbank.GitVersioning needs full history
+
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Build whisper-server
+        run: scripts/build_whisper.sh "$RUNNER_TEMP/whisper"
+
+      - name: Package release
+        run: scripts/package_release.sh ${{ matrix.rid }} dist --whisper-dir "$RUNNER_TEMP/whisper"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openscanner-ai-${{ matrix.rid }}
+          path: dist/openscanner-ai-${{ matrix.rid }}.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Get version
+        id: nbgv
+        run: |
+          dotnet tool install -g nbgv
+          echo "VERSION=$(nbgv get-version -v SemVer2)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Assemble release assets
+        working-directory: dist
+        run: |
+          cp ../scripts/install.sh install.sh
+          sha256sum openscanner-ai-linux-*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+          ls -lh
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.nbgv.outputs.VERSION }}
+        run: |
+          flags=()
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then flags+=(--prerelease); fi
+          # gh uploads the assets to a draft and only then publishes, so
+          # releases/latest never points at a release without its artifacts.
+          gh release create "v$VERSION" \
+            dist/openscanner-ai-linux-x64.tar.gz \
+            dist/openscanner-ai-linux-arm64.tar.gz \
+            dist/install.sh \
+            dist/SHA256SUMS \
+            --target "$GITHUB_SHA" \
+            --title "Release $VERSION" \
+            --generate-notes \
+            "${flags[@]}"

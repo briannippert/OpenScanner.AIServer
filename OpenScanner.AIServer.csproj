@@ -5,9 +5,20 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <RootNamespace>OpenScanner.AIServer</RootNamespace>
+    <!-- Keep packaging output and a local whisper.cpp checkout out of the build and publish. -->
+    <DefaultItemExcludes>$(DefaultItemExcludes);whisper.cpp/**;dist/**</DefaultItemExcludes>
   </PropertyGroup>
 
   <ItemGroup>
+    <!-- Repository files the Web SDK would otherwise publish alongside the server. -->
+    <Content Update="tests/**;schemas/**;version.json" CopyToOutputDirectory="Never" CopyToPublishDirectory="Never" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Nerdbank.GitVersioning" Version="3.9.50">
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+      <PrivateAssets>all</PrivateAssets>
+    </PackageReference>
     <PackageReference Include="Swashbuckle.AspNetCore" Version="10.2.3" />
   </ItemGroup>
 

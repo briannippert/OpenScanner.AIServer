@@ -8,8 +8,8 @@ A .NET Web API server that provides the AI features for [OpenScanner](https://gi
 
 Unlike a per-clip `whisper-cli` invocation, this server keeps models **resident in memory** by managing a pool of long-lived [`whisper-server`](https://github.com/ggerganov/whisper.cpp/tree/master/examples/server) processes. The first request for a model loads it; later requests reuse the warm process, and multiple clips can be transcribed concurrently.
 
-> Formerly **OpenScanner.WhisperServer**. Existing installs are migrated automatically: rerunning
-> `./scripts/install_service.sh` replaces the old `openscanner-whisper` service with `openscanner-ai`.
+> Formerly **OpenScanner.WhisperServer**. Existing installs are migrated automatically: running the
+> installer replaces the old `openscanner-whisper` service with `openscanner-ai`.
 
 ## Contents
 
@@ -26,24 +26,23 @@ Unlike a per-clip `whisper-cli` invocation, this server keeps models **resident 
 
 ## Quick start
 
-You need a Linux machine (Ubuntu/Debian recommended) with a GPU or a fast CPU. The installer handles everything else: .NET, whisper.cpp, Ollama, and both model downloads.
+You need a Debian-based Linux machine (Ubuntu or Debian, x86-64 or 64-bit ARM) with an NVIDIA GPU or a fast CPU. One command installs the latest release; there is nothing to clone or compile first:
 
 ```bash
-git clone https://github.com/briannippert/OpenScanner.AIServer.git
-cd OpenScanner.AIServer
-
-chmod +x scripts/*.sh
-./scripts/install_service.sh
+curl -fsSL https://github.com/briannippert/OpenScanner.AIServer/releases/latest/download/install.sh | bash
 ```
+
+Run it as your normal user. It asks for sudo when it needs it, and the service runs as that user.
 
 The installer will:
 
-1. Install system dependencies (.NET 10 SDK, cmake, ffmpeg)
-2. Prompt for a default Whisper model (pre-warmed at startup) and a port (default `8090`)
-3. Clone and build whisper.cpp, including `whisper-server`, with CUDA if an NVIDIA GPU and the CUDA toolkit are detected
+1. Install the few system packages the server needs (ffmpeg, jq, and similar)
+2. Download the release for your CPU architecture and verify its checksum
+3. Prompt for a default Whisper model (pre-warmed at startup) and a port (default `8090`)
 4. Install and start Ollama, and prompt for the metadata/address LLM (default `qwen3:4b`)
-5. Download missing models, then verify that Whisper loads and the LLM produces structured JSON
-6. Build the .NET server and start it as the `openscanner-ai` systemd service
+5. Set up `whisper-server`: the prebuilt CPU build from the release, or a CUDA build compiled on the machine when an NVIDIA GPU is present (see [Whisper and the GPU](#whisper-and-the-gpu))
+6. Download missing models, then verify that Whisper loads and the LLM produces structured JSON
+7. Start the server as the `openscanner-ai` systemd service
 
 Once it is running:
 
@@ -52,7 +51,24 @@ systemctl status openscanner-ai    # check status
 journalctl -u openscanner-ai -f    # follow logs
 ```
 
-To update, rerun `./scripts/install_service.sh`; it pulls the latest code, rebuilds, and restarts the service. To remove the service, run `./scripts/uninstall_service.sh`. Uninstalling leaves Ollama and its model cache in place, since other apps may use them.
+### Updating
+
+Run the same command again. It installs the latest release and keeps your settings, port, and models. The service keeps running on the old release until the new one is ready, and if the new release does not stay up, the previous one is put back.
+
+### Upgrading from a git-clone install
+
+Earlier versions were built from a checkout by `scripts/install_service.sh`. The installer detects that kind of install and migrates it: it moves the Whisper models out of the checkout, carries over the port and any settings you changed in the checkout's `appsettings.json`, and replaces the service. Run the quick-start command, or run `./scripts/install_service.sh` from the old checkout, which now does the same thing. Afterwards the checkout is no longer used and can be deleted.
+
+If the migration fails partway, the models are moved back and the old service is restarted.
+
+### Uninstalling
+
+```bash
+/opt/openscanner-ai/app/scripts/uninstall.sh           # keeps settings and models
+/opt/openscanner-ai/app/scripts/uninstall.sh --purge   # removes everything
+```
+
+Ollama and its model cache are left in place either way, since other apps may use them.
 
 ## Connecting to OpenScanner
 
@@ -63,27 +79,58 @@ To update, rerun `./scripts/install_service.sh`; it pulls the latest code, rebui
 
 ## Installer reference
 
-| Option | Effect |
-|---|---|
-| `--skip-update` | Build the local checkout without pulling `main`. Use this when installing a feature branch. |
-| `--deps-only` | Set up dependencies, Ollama, and both models, then exit without building or deploying the application. A service that was running beforehand is restored. |
-| `--port=NNNN` | Set the listening port and skip the prompt. |
-| `--rebuild-whisper` | Force a clean rebuild of whisper.cpp, for example after installing the CUDA toolkit. |
-| `--llm-model=NAME` | Select the Ollama model and skip the prompt. `--ollama-model` is an alias. |
-| `--ollama-url=URL` | Override the Ollama origin. Otherwise `Address:OllamaUrl` is used. |
-| `--upgrade-ollama` | Force an upgrade of the managed local Ollama using the official installer. |
-| `--skip-ollama` | Leave Ollama and the `Address` settings untouched. Cannot be combined with the model, URL, or upgrade options. |
-| `--help` | Show all options. Does not need sudo. |
-
-For example, to install the current checkout on port 8099 without prompts:
+Pass options after `bash -s --`:
 
 ```bash
-bash scripts/install_service.sh --skip-update --port=8099 --llm-model=qwen3:4b
+curl -fsSL https://github.com/briannippert/OpenScanner.AIServer/releases/latest/download/install.sh \
+  | bash -s -- --port 8099 --llm-model qwen3:4b --yes
 ```
+
+Options that take a value accept either `--port 8099` or `--port=8099`.
+
+| Option | Effect |
+|---|---|
+| `--version TAG` | Install a specific release, for example `v0.1.42`. The default is the latest. |
+| `--tarball PATH` | Install from a local release tarball instead of downloading one. |
+| `--migrate-from DIR` | Carry settings and models over from a git-clone install at `DIR`. Normally detected automatically. |
+| `--port N` | Set the listening port and skip the prompt. |
+| `--whisper-model NAME` | Set the default Whisper model and skip the prompt. |
+| `--llm-model NAME` | Select the Ollama model and skip the prompt. `--ollama-model` is an alias. |
+| `--ollama-url URL` | Override the Ollama origin. Otherwise `Address:OllamaUrl` is used. |
+| `--upgrade-ollama` | Force an upgrade of the managed local Ollama using the official installer. |
+| `--skip-ollama` | Leave Ollama and the `Address` settings untouched. Cannot be combined with the model, URL, or upgrade options. |
+| `--cpu-only` | Do not build or use GPU acceleration, even if an NVIDIA GPU is present. |
+| `--rebuild-whisper` | Rebuild `whisper-server` on this machine, for example after changing the CUDA toolkit. |
+| `--no-model` | Do not download or check the Whisper model. |
+| `--user NAME` | Account the service runs as. The default is the user running the installer. |
+| `--yes` | Never prompt. Keeps the current settings, or uses the defaults on a first install. |
+| `--help` | Show all options. |
+
+Prompts are also skipped when there is no terminal to ask on, such as in a provisioning script.
+
+### What gets installed where
+
+Everything lives under `/opt/openscanner-ai` (set `OPENSCANNER_AI_HOME` to use another location):
+
+| Path | Contents | On update |
+|---|---|---|
+| `app/` | The release: the self-contained server, the prebuilt `whisper-server`, and the install scripts | Replaced |
+| `app.prev/` | The previous release, kept for rollback | Replaced |
+| `config/appsettings.json` | Your settings, layered over the release's defaults | Kept |
+| `whisper/models/` | Downloaded Whisper models | Kept |
+| `whisper/bin/` | A `whisper-server` compiled on this machine, when one was needed | Kept, rebuilt when the release moves to a newer whisper.cpp |
+
+### Whisper and the GPU
+
+Each release ships a portable CPU build of `whisper-server`. A CUDA build has to match the CUDA version on the machine, so it is not shipped: when the installer finds a working NVIDIA GPU, it installs the CUDA toolkit and build tools if they are missing and compiles `whisper-server` there. This takes several minutes on the first install and is reused by later updates.
+
+- If the CUDA build fails, the installer falls back to CPU transcription and says so. Rerun with `--rebuild-whisper` once the toolkit is fixed.
+- On a CPU without the instructions the prebuilt binary needs (AVX2 on x86-64), the installer compiles a CPU build for the machine.
+- This project does not install or update NVIDIA drivers.
 
 ### LLM model selection
 
-The prompt offers `qwen3:4b`, `qwen3:1.7b`, or a custom model; pressing Enter keeps the configured `Address:Model`. A model is downloaded only if it is missing. The installer then test-loads it with the same settings the API uses (4,096-token context, thinking disabled, JSON Schema output) and unloads it so Whisper startup can use the GPU. Model and URL settings are saved only after this verification succeeds.
+The prompt offers `qwen3:4b`, `qwen3:1.7b`, or a custom model; pressing Enter keeps the configured `Address:Model`. A model is downloaded only if it is missing. The installer then test-loads it with the same settings the API uses (4,096-token context, thinking disabled, JSON Schema output) and unloads it afterwards. Model and URL settings are saved only after this verification succeeds.
 
 ### Local Ollama
 
@@ -99,11 +146,13 @@ For a remote URL or an HTTPS reverse proxy, the installer only downloads the mod
 
 ### If a step fails
 
-The installer tries to restart a service that was running before it started. This restores availability; it is not a transactional rollback of dependencies or configuration that were already installed.
+Preparation happens while the existing service keeps running: downloading the release, setting up Ollama, building `whisper-server`, and fetching models. A failure there leaves the running install untouched.
+
+The service is stopped only for the final switch. If the new release does not stay up, the previous release, its settings, and its systemd unit are restored and restarted. Packages, Ollama, and models that were already installed are not rolled back.
 
 ## Manual setup
 
-To build whisper.cpp yourself instead of using the installer:
+To run from source instead of a release, you need the .NET 10 SDK, whisper.cpp, and Ollama. Build whisper.cpp:
 
 ```bash
 git clone https://github.com/ggerganov/whisper.cpp.git
@@ -134,7 +183,15 @@ Without `--urls`, the development default is port 5000.
 
 ## Configuration
 
-Settings live in `appsettings.json`; the installer writes the Whisper and LLM values for you. Any setting can also be overridden with an environment variable that uses double underscores, for example `Address__Model=qwen3:1.7b` or `Geocoding__TimeoutSeconds=60`.
+On an installed server, put your settings in `/opt/openscanner-ai/config/appsettings.json` and restart the service (`sudo systemctl restart openscanner-ai`). The file only needs the values you want to change; everything else comes from the release's defaults, and the installer writes the Whisper and LLM values there for you. For example:
+
+```json
+{
+  "Geocoding": { "DefaultCity": "Derry", "DefaultState": "NH" }
+}
+```
+
+When running from source, edit `appsettings.json` in the checkout instead. Either way, any setting can also be overridden with an environment variable that uses double underscores, for example `Address__Model=qwen3:1.7b` or `Geocoding__TimeoutSeconds=60`.
 
 ### `Whisper`
 
@@ -209,6 +266,7 @@ The LLM endpoints work independently of Whisper readiness.
 ```json
 {
   "status": "ok",
+  "version": "0.1.42+abc1234def",
   "defaultModel": "large-v3-turbo-q5_0",
   "binaryFound": true,
   "defaultModelFound": true,
@@ -558,7 +616,7 @@ To check a setup, run transcription and address extraction at the same time whil
 
 [Ollama's hardware documentation](https://docs.ollama.com/gpu) lists the GTX 1070 as compute capability 6.1 and currently requires NVIDIA driver 570 or newer for that generation. This project does not install or update drivers.
 
-If you install the CUDA toolkit after the initial setup, rerun the installer with `--rebuild-whisper` to recompile whisper.cpp with GPU support.
+If you change the CUDA toolkit after the initial setup, rerun the installer with `--rebuild-whisper` to recompile `whisper-server` against it.
 
 ## Development and testing
 
@@ -571,10 +629,26 @@ dotnet build
 for f in scripts/*.sh; do bash -n "$f"; done
 python3 scripts/test_address_endpoint.py    # endpoint contracts, failure paths, Swagger, geocoding, caching
 python3 scripts/test_street_fallback.py     # building, street-repair and street-center fallbacks
-python3 scripts/test_ollama_setup.py        # installer's Ollama provisioning
+python3 scripts/test_ollama_setup.py        # installer: Ollama provisioning, install, update, rollback, migration
 ```
 
 `test_street_fallback.py --centers-only` runs just the street-center checks.
+
+### Releases
+
+A release is a self-contained tarball per architecture (`openscanner-ai-linux-x64.tar.gz`, `openscanner-ai-linux-arm64.tar.gz`), plus `install.sh` and `SHA256SUMS`. To publish one, run the **Release** workflow from the Actions tab ([.github/workflows/release.yml](.github/workflows/release.yml)). Run from `main` it publishes `v<version>` as the latest release, which is what the install command fetches. Run from any other branch it publishes a pre-release, which installs ignore, so the pipeline can be tried safely.
+
+Versions come from [Nerdbank.GitVersioning](https://github.com/dotnet/Nerdbank.GitVersioning): `version.json` sets the major and minor, and the patch number is the commit height. The running version is reported by `/health`.
+
+To build and install a release from a checkout:
+
+```bash
+scripts/build_whisper.sh /tmp/whisper
+scripts/package_release.sh linux-x64 dist --whisper-dir /tmp/whisper
+scripts/install.sh --tarball dist/openscanner-ai-linux-x64.tar.gz
+```
+
+`scripts/test_installer.sh` runs the real install, update, rollback, uninstall, and migration cycle against a tarball built from the checkout. It installs system-wide and replaces any existing install, so it only runs on CI ([.github/workflows/installer-test.yml](.github/workflows/installer-test.yml)) or with `--force` on a throwaway machine.
 
 ### Live checks
 
