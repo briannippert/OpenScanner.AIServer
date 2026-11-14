@@ -17,7 +17,7 @@ public sealed class LocalPlace
 }
 
 public sealed class PlaceGeocoder(IHttpClientFactory clients, IConfiguration config,
-    AddressGeocoder census, UpstreamThrottle throttle) : IDisposable
+    AddressGeocoder census, UpstreamThrottle throttle, Gazetteer gazetteer) : IDisposable
 {
     private readonly MemoryCache cache = new(new MemoryCacheOptions { SizeLimit = 1000 });
     public string DefaultCity => config["Geocoding:DefaultCity"] ?? "Salem";
@@ -41,6 +41,26 @@ public sealed class PlaceGeocoder(IHttpClientFactory clients, IConfiguration con
             }
             return new GeocodeResponse(matches.Count > 0, matches, "Local directory / US Census Bureau",
                 matches.Count == 1 ? 0 : null, matches.Count switch { 0 => "no_match", 1 => "single_match", _ => "ambiguous" });
+        }
+
+        // The city's own complete business list, when it has been downloaded.
+        if (gazetteer.TryGet(city, state) is { } index)
+        {
+            var (found, exact) = index.FindPlaces(name);
+            if (found.Count > 0)
+            {
+                var code = Geo.StateCode(state);
+                var matches = found.Select(p => new GeocodeMatch(
+                    string.Join(", ", new[] { string.Join(" ", new[] { p.HouseNumber, p.Street }.Where(v => !string.IsNullOrWhiteSpace(v))),
+                        city, code, p.PostalCode }.Where(v => !string.IsNullOrWhiteSpace(v))),
+                    p.Latitude, p.Longitude, p.Name, p.HouseNumber, p.Street, city, code, p.PostalCode, "US",
+                    Geo.OsmAttribution, Precision: "place", Provider: Gazetteer.Provider)).ToList();
+                // Only an exact, unique name is selected here; anything else is
+                // left for the resolver to verify against the transmission.
+                var certain = exact && matches.Count == 1;
+                return new GeocodeResponse(true, matches, Gazetteer.Provider, certain ? 0 : null,
+                    certain ? "single_match" : "ambiguous");
+            }
         }
 
         return await SearchPhotonAsync(name, city, state, null, null, ct);

@@ -4,10 +4,11 @@ using Microsoft.Extensions.Caching.Memory;
 
 namespace OpenScanner.AIServer.Services;
 
-// Photon supplies street names, never house coordinates. Census must validate the
-// unchanged house number on a unique, similar street in the requested locality.
+// The gazetteer (or Photon, until a city is loaded) supplies street names, never
+// house coordinates. Census must validate the unchanged house number on a unique,
+// similar street in the requested locality.
 public sealed class StreetGeocoder(IHttpClientFactory clients, IConfiguration config,
-    AddressGeocoder census, UpstreamThrottle throttle) : IDisposable
+    AddressGeocoder census, UpstreamThrottle throttle, Gazetteer gazetteer) : IDisposable
 {
     private readonly MemoryCache cache = new(new MemoryCacheOptions { SizeLimit = 1000 });
     private sealed record Road(string Name, double West, double South, double East, double North,
@@ -29,8 +30,20 @@ public sealed class StreetGeocoder(IHttpClientFactory clients, IConfiguration co
         deadline.CancelAfter(Geo.Timeout(config));
         ct = deadline.Token;
         // Approximate pins require the actual named street, not a fuzzy alternative.
-        var roads = (await FindRoadsAsync(street, city, state, ct)).Where(r => SameStreet(r.Name, street) &&
+        var local = gazetteer.TryGet(city, state) is not null;
+        var found = await FindRoadsAsync(street, city, state, ct);
+        var roads = found.Where(r => SameStreet(r.Name, street) &&
             r.Longitude.HasValue && r.Latitude.HasValue).ToList();
+        if (roads.Count == 0 && local)
+        {
+            // Dispatchers drop the road type ("16 Garabedian"). With the city's whole
+            // street list in hand, a single street completing the name is not a guess.
+            var completed = found.Where(r => CompletesStreetSuffix(street, r.Name)).Select(r => r.Name)
+                .Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+            if (completed.Count == 1)
+                roads = found.Where(r => Same(r.Name, completed[0]) && r.Longitude.HasValue && r.Latitude.HasValue).ToList();
+        }
+        var provider = local ? Gazetteer.Provider : "Photon / OpenStreetMap";
         GeocodeMatch? match = null;
         if (roads.Count > 0)
         {
@@ -46,10 +59,10 @@ public sealed class StreetGeocoder(IHttpClientFactory clients, IConfiguration co
                 match = new GeocodeMatch($"{road.Name}, {city}, {StateCode(state)}", road.Latitude!.Value,
                     road.Longitude!.Value, Street: road.Name, City: city, State: StateCode(state), Country: "US",
                     Attribution: Geo.OsmAttribution,
-                    Precision: "street", Provider: "Photon / OpenStreetMap");
+                    Precision: "street", Provider: provider);
             }
         }
-        var result = new GeocodeResponse(match is not null, match is null ? [] : [match], "Photon / OpenStreetMap",
+        var result = new GeocodeResponse(match is not null, match is null ? [] : [match], provider,
             match is null ? null : 0, match is null ? "no_match" : "approximate_street");
         cache.Set(key, result, new MemoryCacheEntryOptions { Size = 1, AbsoluteExpirationRelativeToNow = TimeSpan.FromHours(24) });
         return match;
@@ -61,9 +74,7 @@ public sealed class StreetGeocoder(IHttpClientFactory clients, IConfiguration co
         if (!Regex.IsMatch(house, @"^\d+[A-Za-z]?(?:-\d+)?$") ||
             street.Length > 150 || city.Length > 100 || state.Length > 100 || crossStreet?.Length > 300)
             return null;
-        var crosses = string.IsNullOrWhiteSpace(crossStreet) ? [] :
-            Regex.Split(crossStreet, @"\s+(?:and|at)\s+|\s*[&/]\s*", RegexOptions.IgnoreCase)
-                .Select(s => s.Trim()).Where(s => s.Length > 0).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+        var crosses = SplitCrossStreets(crossStreet);
         if (crosses.Length > 2) return null;
         var key = JsonSerializer.Serialize(new[] { house, street, city, state, crossStreet }).ToUpperInvariant();
         if (cache.TryGetValue<GeocodeResponse>(key, out var cached)) return cached!.SelectedMatch;
@@ -107,8 +118,65 @@ public sealed class StreetGeocoder(IHttpClientFactory clients, IConfiguration co
         return result.SelectedMatch;
     }
 
+    private static string[] SplitCrossStreets(string? crossStreet) => string.IsNullOrWhiteSpace(crossStreet) ? [] :
+        Regex.Split(crossStreet, @"\s+(?:and|at)\s+|\s*[&/]\s*", RegexOptions.IgnoreCase)
+            .Select(s => s.Trim()).Where(s => s.Length > 0).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+
+    /// <summary>
+    /// The corner of two streets, from the gazetteer only. Each spoken name may fit
+    /// several streets ("Broadway" for North and South Broadway); a pin is returned
+    /// only when every pair of them that actually meets does so at the same place.
+    /// </summary>
+    public GeocodeMatch? ResolveIntersection(string street, string crossStreet, string city, string state)
+    {
+        if (street.Length > 150 || crossStreet.Length > 300 || city.Length > 100 || state.Length > 100) return null;
+        var crosses = SplitCrossStreets(crossStreet);
+        if (crosses.Length != 1 || gazetteer.TryGet(city, state) is not { } index) return null;
+        var corners = (from a in IntersectionCandidates(index, street)
+                       from b in IntersectionCandidates(index, crosses[0])
+                       where !Same(a.Name, b.Name) && a.Junctions.ContainsKey(b.Name)
+                       select (a, b, Points: a.Junctions[b.Name])).ToList();
+        var points = corners.SelectMany(c => c.Points).ToList();
+        if (points.Count == 0) return null;
+        var (first, second, _) = corners[0];
+        var lat = points.Average(p => p[0]);
+        var lon = points.Average(p => p[1]);
+        // A divided road meets a cross street at two nearby points; streets that
+        // meet twice far apart do not identify one corner.
+        if (points.Any(p => Math.Sqrt(Math.Pow((p[0] - lat) * 111_000, 2) +
+            Math.Pow((p[1] - lon) * 111_000 * Math.Cos(lat * Math.PI / 180), 2)) > 150)) return null;
+        return new GeocodeMatch($"{first.Name} & {second.Name}, {city}, {StateCode(state)}", lat, lon,
+            Street: first.Name, City: city, State: StateCode(state), Country: "US",
+            Attribution: Geo.OsmAttribution, Precision: "intersection", Provider: Gazetteer.Provider);
+    }
+
+    private static List<GazetteerStreet> IntersectionCandidates(CityIndex index, string name)
+    {
+        var close = index.FindStreets(name);
+        var named = close.Where(s => SameStreet(name, s.Name) || CompletesStreetSuffix(name, s.Name)).ToList();
+        if (named.Count == 0)
+        {
+            // "Broadway" for "North Broadway": a dropped direction, tolerated here
+            // because the two streets must also really intersect.
+            named = index.Data.Streets.Where(s =>
+            {
+                var words = Normalize(s.Name).Split(' ');
+                if (words.Length < 2 || words[0] is not ("n" or "s" or "e" or "w")) return false;
+                var rest = string.Join(' ', words[1..]);
+                return SameStreet(name, rest) || CompletesStreetSuffix(name, rest);
+            }).ToList();
+        }
+        var candidates = named.Count > 0 ? named : close;
+        return candidates.Count <= 5 ? candidates : [];
+    }
+
     private async Task<List<Road>> FindRoadsAsync(string street, string city, string state, CancellationToken ct)
     {
+        if (gazetteer.TryGet(city, state) is { } index)
+            // Same shape as the live search: one entry per mapped segment, broad ones dropped.
+            return index.FindStreets(street).SelectMany(s => s.Segments
+                .Where(g => g.Length == 6 && g[2] - g[0] <= .1 && g[3] - g[1] <= .1)
+                .Select(g => new Road(s.Name, g[0], g[1], g[2], g[3], g[5], g[4]))).ToList();
         var words = Regex.Matches(street, @"[\p{L}\p{N}]+").Select(m => m.Value).ToArray();
         if (words.Length == 0) return [];
         // Prefix the main name, retaining any directional and road-type tokens.
@@ -164,35 +232,61 @@ public sealed class StreetGeocoder(IHttpClientFactory clients, IConfiguration co
 
     private static bool Near(Road a, Road b) => a.West <= b.East + .0003 && a.East + .0003 >= b.West &&
         a.South <= b.North + .0003 && a.North + .0003 >= b.South;
-    private static string Normalize(string value) => string.Join(" ", Regex.Matches(value.ToLowerInvariant(), @"[\p{L}\p{N}]+")
+    internal static string Normalize(string value) => string.Join(" ", Regex.Matches(value.ToLowerInvariant(), @"[\p{L}\p{N}]+")
         .Select(m => Suffixes.GetValueOrDefault(m.Value, m.Value)));
     internal static bool SameStreet(string left, string right) => Normalize(left) == Normalize(right);
     internal static bool CompletesStreetSuffix(string input, string candidate)
     {
         var a = Normalize(input).Split(' ');
         var b = Normalize(candidate).Split(' ');
-        var suffixes = Suffixes.Values.Except(["n", "s", "e", "w"]);
-        return b.Length == a.Length + 1 && suffixes.Contains(b[^1]) && !suffixes.Contains(a[^1]) &&
+        return b.Length == a.Length + 1 && RoadTypes.Contains(b[^1]) && !RoadTypes.Contains(a[^1]) &&
             Normalize(input) == string.Join(' ', b[..^1]);
     }
-    internal static bool Similar(string input, string candidate)
+    private static readonly HashSet<string> RoadTypes = Suffixes.Values.Except(["n", "s", "e", "w"]).ToHashSet();
+
+    // The parts of two names that may differ by a misspelling: everything but the
+    // road type, which must agree when given, and a direction, which must agree.
+    private static bool Comparable(string input, string candidate, out string left, out string right)
     {
-        if (SameStreet(input, candidate) || CompletesStreetSuffix(input, candidate)) return true;
+        left = right = "";
         var a = Normalize(input).Split(' ');
         var b = Normalize(candidate).Split(' ');
-        var suffixes = Suffixes.Values.Except(["n", "s", "e", "w"]).ToHashSet();
-        var sourceSuffix = suffixes.Contains(a[^1]);
-        var candidateSuffix = suffixes.Contains(b[^1]);
+        var sourceSuffix = RoadTypes.Contains(a[^1]);
+        var candidateSuffix = RoadTypes.Contains(b[^1]);
         // A supplied road type must agree. A missing type may be completed along
         // with a bounded name correction, e.g. Graymoor Woods -> Braemoor Woods Rd.
         if (sourceSuffix && (!candidateSuffix || a[^1] != b[^1])) return false;
         var leftWords = sourceSuffix ? a[..^1] : a;
         var rightWords = candidateSuffix ? b[..^1] : b;
-        if (leftWords.Length == 0 || leftWords.Length != rightWords.Length) return false;
+        if (leftWords.Length == 0 || rightWords.Length == 0) return false;
+        if (leftWords.Length != rightWords.Length)
+        {
+            // Only a word run together or split apart: "Wood Meadow" for "Woodmeadow".
+            left = right = string.Concat(leftWords);
+            return left == string.Concat(rightWords);
+        }
         if ((leftWords[0] is "n" or "s" or "e" or "w" || rightWords[0] is "n" or "s" or "e" or "w") &&
             leftWords[0] != rightWords[0]) return false;
-        var left = string.Join(' ', leftWords);
-        var right = string.Join(' ', rightWords);
+        left = string.Join(' ', leftWords);
+        right = string.Join(' ', rightWords);
+        return true;
+    }
+
+    internal static bool Similar(string input, string candidate)
+    {
+        if (SameStreet(input, candidate) || CompletesStreetSuffix(input, candidate)) return true;
+        return Comparable(input, candidate, out var left, out var right) &&
+            Distance(left, right) <= Math.Min(2, Math.Min(left.Length, right.Length) / 3);
+    }
+
+    /// <summary>A mishearing spelled differently but pronounced alike ("Pellum" for
+    /// "Pelham"). Only used against a city's complete street list.</summary>
+    internal static bool SoundsAlike(string input, string candidate) =>
+        Comparable(input, candidate, out var left, out var right) && left.Length >= 4 && right.Length >= 4 &&
+        Math.Abs(left.Length - right.Length) <= 2 && Distance(left, right) <= 3 && Phonetic(left) == Phonetic(right);
+
+    internal static int Distance(string left, string right)
+    {
         var previous = Enumerable.Range(0, right.Length + 1).ToArray();
         for (var i = 1; i <= left.Length; i++)
         {
@@ -202,7 +296,37 @@ public sealed class StreetGeocoder(IHttpClientFactory clients, IConfiguration co
                     previous[j - 1] + (left[i - 1] == right[j - 1] ? 0 : 1));
             previous = current;
         }
-        return previous[^1] <= Math.Min(2, Math.Min(left.Length, right.Length) / 3);
+        return previous[^1];
+    }
+
+    /// <summary>A rough per-word consonant skeleton: silent and doubled letters and
+    /// vowels after the first letter are dropped, like-sounding letters are merged.</summary>
+    internal static string Phonetic(string value) => string.Join(" ",
+        Regex.Matches(value.ToLowerInvariant(), @"[\p{L}\p{N}]+").Select(m => PhoneticWord(m.Value)));
+
+    private static string PhoneticWord(string word)
+    {
+        if (word.All(char.IsDigit)) return word;
+        word = Regex.Replace(word, @"[^a-z]", "");
+        word = Regex.Replace(word, "^kn", "n");
+        word = Regex.Replace(word, "^wr", "r");
+        word = word.Replace("tch", "C").Replace("sch", "sk").Replace("ch", "C").Replace("sh", "S").Replace("th", "T")
+            .Replace("ph", "f").Replace("ck", "k").Replace("dg", "j").Replace("qu", "kw").Replace("x", "ks").Replace("z", "s");
+        word = Regex.Replace(word, "c(?=[eiy])", "s").Replace("c", "k").Replace("gh", "").Replace("h", "");
+        var key = new System.Text.StringBuilder();
+        for (var i = 0; i < word.Length; i++)
+        {
+            var letter = word[i];
+            // W is a consonant only before a vowel ("Broadway", not "Brown").
+            if (letter == 'w' && (i == 0 || (i + 1 < word.Length && "aeiouy".Contains(word[i + 1])))) { }
+            else if ("aeiouyw".Contains(letter))
+            {
+                if (i > 0) continue;
+                letter = 'a';
+            }
+            if (key.Length == 0 || key[^1] != letter) key.Append(letter);
+        }
+        return key.ToString();
     }
     private static string? Text(JsonElement value, string field) => Geo.Text(value, field);
     private static bool Same(string? a, string? b) => Geo.Same(a, b);

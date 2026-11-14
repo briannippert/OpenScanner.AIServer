@@ -18,7 +18,8 @@ public sealed class GeocodeResolver(AddressGeocoder geocoder, AddressExtractor e
         state = string.IsNullOrWhiteSpace(state) ? places.DefaultState : state;
         var result = await places.SearchAsync(name, city, state, ct);
         return await SelectAsync($"{name}, {city}, {state}", context, result,
-            result.Provider == "Photon / OpenStreetMap", ct);
+            result.Provider == "Photon / OpenStreetMap" ||
+            (result.Provider == Gazetteer.Provider && result.SelectedMatchIndex is null), ct);
     }
 
     private async Task<GeocodeResponse> SelectAsync(string address, string? context,

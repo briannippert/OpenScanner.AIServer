@@ -195,6 +195,7 @@ env=dict(os.environ, Address__OllamaUrl=f'http://127.0.0.1:{backend.server_port}
          Geocoding__Endpoint=f'http://127.0.0.1:{backend.server_port}/geocoder', Geocoding__TimeoutSeconds='2',
          Geocoding__PlaceEndpoint=f'http://127.0.0.1:{backend.server_port}/places',
          Geocoding__StreetEndpoint=f'http://127.0.0.1:{backend.server_port}/streets',
+         Geocoding__Gazetteer__Enabled='false',
          Address__TimeoutSeconds='1', Whisper__WhisperServerBinary=str(whisper),
          Whisper__ModelsDir=str(fixture_dir), Whisper__DefaultModel='test', Whisper__BasePort=str(whisper_port),
          Whisper__UseGpu='false', MOCK_TRANSCRIPT_FILE=str(transcript_file))

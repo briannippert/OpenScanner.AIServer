@@ -11,7 +11,7 @@ public sealed record ModelInfo(string Id, string Label);
 public sealed record ModelsResponse(IReadOnlyList<ModelInfo> Models);
 public sealed record HealthResponse(string Status, string Version, string DefaultModel, bool BinaryFound,
     bool DefaultModelFound, IReadOnlyList<string> LoadedModels, string Acceleration,
-    string Cpu, string? Gpu, int? GpuMemoryMb);
+    string Cpu, string? Gpu, int? GpuMemoryMb, IReadOnlyList<GazetteerCity> Gazetteer);
 public sealed record AddressResponse(string? Address, string? HouseNumber, string? Street,
     string? Unit, string? City, string? State, string? PostalCode, string? Country, string? CrossStreet,
     GeocodeMatch? Geocode, string? PlaceName);
