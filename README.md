@@ -6,17 +6,27 @@ A .NET Web API server that provides the AI features for [OpenScanner](https://gi
 - **Incident metadata:** call type, service, status and a summary, extracted from each transmission by a local LLM (Ollama)
 - **Location lookup:** addresses, intersections and businesses, geocoded through the US Census and OpenStreetMap
 
+Unlike a per-clip `whisper-cli` invocation, this server keeps models **resident in memory** by managing a pool of long-lived [`whisper-server`](https://github.com/ggerganov/whisper.cpp/tree/master/examples/server) processes. The first request for a model loads it; later requests reuse the warm process, and multiple clips can be transcribed concurrently.
+
 > Formerly **OpenScanner.WhisperServer**. Existing installs are migrated automatically: rerunning
 > `./scripts/install_service.sh` replaces the old `openscanner-whisper` service with `openscanner-ai`.
 
-Unlike a per-clip `whisper-cli` invocation, this server keeps models **resident in memory** by managing a pool of long-lived [`whisper-server`](https://github.com/ggerganov/whisper.cpp/tree/master/examples/server) processes. The first request for a model loads it; subsequent requests reuse the warm process, and multiple clips can be transcribed **concurrently**.
+## Contents
 
-## Prerequisites
+- [Quick start](#quick-start)
+- [Connecting to OpenScanner](#connecting-to-openscanner)
+- [Installer reference](#installer-reference)
+- [Manual setup](#manual-setup)
+- [Configuration](#configuration)
+- [API](#api)
+- [How location lookup works](#how-location-lookup-works)
+- [GPU memory: sharing a card between Whisper and the LLM](#gpu-memory-sharing-a-card-between-whisper-and-the-llm)
+- [Development and testing](#development-and-testing)
+- [License](#license)
 
-- A Linux machine (Ubuntu/Debian recommended) with a GPU or fast CPU
-- The installer handles .NET, whisper.cpp, Ollama, and both model downloads
+## Quick start
 
-## Quick Start
+You need a Linux machine (Ubuntu/Debian recommended) with a GPU or a fast CPU. The installer handles everything else: .NET, whisper.cpp, Ollama, and both model downloads.
 
 ```bash
 git clone https://github.com/briannippert/OpenScanner.AIServer.git
@@ -27,83 +37,73 @@ chmod +x scripts/*.sh
 ```
 
 The installer will:
+
 1. Install system dependencies (.NET 10 SDK, cmake, ffmpeg)
-2. Prompt you to select a default Whisper model (pre-warmed at startup)
-3. Prompt you to choose a port (default: 8090)
-4. Clone and build whisper.cpp — including `whisper-server` — (with CUDA if an NVIDIA GPU is detected)
-5. Install/start Ollama and select a metadata/address LLM (keep the configured model, default `qwen3:4b`)
-6. Download missing models and verify Whisper loading plus LLM structured JSON output
-7. Build the .NET server
-8. Configure and start the application service, ordered after managed local Ollama
+2. Prompt for a default Whisper model (pre-warmed at startup) and a port (default `8090`)
+3. Clone and build whisper.cpp, including `whisper-server`, with CUDA if an NVIDIA GPU and the CUDA toolkit are detected
+4. Install and start Ollama, and prompt for the metadata/address LLM (default `qwen3:4b`)
+5. Download missing models, then verify that Whisper loads and the LLM produces structured JSON
+6. Build the .NET server and start it as the `openscanner-ai` systemd service
 
-### Installer Options
+Once it is running:
 
-- `--skip-update`: Build local code without pulling main (use this when installing a feature branch)
-- `--deps-only`: Set up dependencies, Ollama, and both model downloads/checks, then exit without building/deploying the application. A previously running Whisper service is restored.
-- `--port=NNNN`: Set the listening port (skips the interactive prompt)
-- `--rebuild-whisper`: Force a clean rebuild of whisper.cpp (useful after installing CUDA)
-- `--llm-model=NAME`: Select the Ollama model without its interactive prompt (`--ollama-model` is an alias)
-- `--ollama-url=URL`: Override the Ollama origin; otherwise use `Address.OllamaUrl` (or `Address__OllamaUrl`)
-- `--upgrade-ollama`: Force an upgrade of the managed local Ollama installation using the official installer
-- `--skip-ollama`: Leave Ollama and `Address` settings unchanged; run only the existing Whisper/application setup
-- `--help`: Show all installer options without sudo
+```bash
+systemctl status openscanner-ai    # check status
+journalctl -u openscanner-ai -f    # follow logs
+```
 
-For this checkout on port 8099:
+To update, rerun `./scripts/install_service.sh`; it pulls the latest code, rebuilds, and restarts the service. To remove the service, run `./scripts/uninstall_service.sh`. Uninstalling leaves Ollama and its model cache in place, since other apps may use them.
+
+## Connecting to OpenScanner
+
+1. In the OpenScanner UI, go to **Settings → Transcription** and enable **AI Transcription**.
+2. Set the **Backend** to **Remote**.
+3. Enter the server URL (for example `http://192.168.1.100:8090`) and click **Test**.
+4. Pick a **Model** from the list, which is queried live from this server.
+
+## Installer reference
+
+| Option | Effect |
+|---|---|
+| `--skip-update` | Build the local checkout without pulling `main`. Use this when installing a feature branch. |
+| `--deps-only` | Set up dependencies, Ollama, and both models, then exit without building or deploying the application. A service that was running beforehand is restored. |
+| `--port=NNNN` | Set the listening port and skip the prompt. |
+| `--rebuild-whisper` | Force a clean rebuild of whisper.cpp, for example after installing the CUDA toolkit. |
+| `--llm-model=NAME` | Select the Ollama model and skip the prompt. `--ollama-model` is an alias. |
+| `--ollama-url=URL` | Override the Ollama origin. Otherwise `Address:OllamaUrl` is used. |
+| `--upgrade-ollama` | Force an upgrade of the managed local Ollama using the official installer. |
+| `--skip-ollama` | Leave Ollama and the `Address` settings untouched. Cannot be combined with the model, URL, or upgrade options. |
+| `--help` | Show all options. Does not need sudo. |
+
+For example, to install the current checkout on port 8099 without prompts:
 
 ```bash
 bash scripts/install_service.sh --skip-update --port=8099 --llm-model=qwen3:4b
 ```
 
-The LLM prompt offers `qwen3:4b`, `qwen3:1.7b`, or a custom model. Enter keeps
-`Address.Model` (or `Address__Model`). The explicit CLI model takes precedence.
-Whisper model selection remains separate. A model is downloaded only if missing;
-Ollama verifies downloads and the installer then tests loading with the same
-4,096-token context, `think=false`, and JSON Schema support used by the API. The
-short probe unloads the LLM afterward so Whisper startup can use the GPU. Model
-and URL settings are saved only after verification succeeds.
+### LLM model selection
 
-For a local HTTP loopback endpoint with an explicit port, the installer installs
-Ollama if its CLI/service is missing, starts/enables `ollama.service`, and writes
-`/etc/systemd/system/ollama.service.d/openscanner.conf`. This binds to loopback and
-sets `OLLAMA_NUM_PARALLEL=1` and `OLLAMA_MAX_LOADED_MODELS=1`. Other drop-ins are
-preserved. Current Ollama is retained unless `--upgrade-ollama` is supplied or a
-model download reports that a newer version is required; in that case the official
-[Linux installer](https://docs.ollama.com/linux) is run once and setup retries.
-The required download tools (`curl`, CA certificates, `zstd`) are installed first.
+The prompt offers `qwen3:4b`, `qwen3:1.7b`, or a custom model; pressing Enter keeps the configured `Address:Model`. A model is downloaded only if it is missing. The installer then test-loads it with the same settings the API uses (4,096-token context, thinking disabled, JSON Schema output) and unloads it so Whisper startup can use the GPU. Model and URL settings are saved only after this verification succeeds.
 
-For a configured remote URL or HTTPS reverse proxy, only model download and the
-API verification run against that endpoint. Its local installation and service are
-not changed. Remote upgrades must be performed on that host. URLs must be HTTP(S)
-origins without credentials, paths, query strings, or fragments. Loopback ports
-managed by this installer must be 1024–65535. `--skip-ollama` cannot be combined
-with model, URL, or Ollama upgrade options.
+### Local Ollama
 
-If a setup step fails, the installer attempts to restart a Whisper service that
-was running beforehand. This restores availability; it is not a transactional
-rollback of dependencies or configuration already installed. Uninstalling the
-Whisper service leaves Ollama and its model cache installed, since other apps may
-use them.
+When `Address:OllamaUrl` is a local HTTP loopback address with an explicit port (1024–65535), the installer manages Ollama for you:
 
-Installer checks: `bash -n scripts/install_service.sh scripts/setup_ollama.sh` and
-`python3 scripts/test_ollama_setup.py`. The provisioning suite uses local HTTP and
-mock system commands; it never changes real services, `/etc`, packages, or models.
+- Installs Ollama if its CLI or service is missing, then starts and enables `ollama.service`.
+- Writes `/etc/systemd/system/ollama.service.d/openscanner.conf`, which binds Ollama to loopback and sets `OLLAMA_NUM_PARALLEL=1` and `OLLAMA_MAX_LOADED_MODELS=1`. Other drop-ins are preserved.
+- Keeps the installed Ollama version unless you pass `--upgrade-ollama` or a model download reports that a newer version is required. In that case the official [Linux installer](https://docs.ollama.com/linux) runs once and setup retries.
 
+### Remote Ollama
 
-### GPU Acceleration
+For a remote URL or an HTTPS reverse proxy, the installer only downloads the model and runs the API verification against that endpoint. It does not change that host's installation or service, and upgrades must be done there. URLs must be HTTP(S) origins without credentials, paths, query strings, or fragments.
 
-The installer automatically detects NVIDIA GPUs and enables CUDA acceleration when the CUDA toolkit is installed. If you install the CUDA toolkit after the initial setup, re-run the installer with `--rebuild-whisper` to recompile whisper.cpp with GPU support.
+### If a step fails
 
-### Uninstall
+The installer tries to restart a service that was running before it started. This restores availability; it is not a transactional rollback of dependencies or configuration that were already installed.
 
-```bash
-./scripts/uninstall_service.sh
-```
+## Manual setup
 
-## Manual Setup
-
-### Building whisper.cpp
-
-The resident `whisper-server` binary is built by default as part of the examples:
+To build whisper.cpp yourself instead of using the installer:
 
 ```bash
 git clone https://github.com/ggerganov/whisper.cpp.git
@@ -116,66 +116,93 @@ cmake --build build --config Release   # produces build/bin/whisper-server
 bash models/download-ggml-model.sh large-v3-turbo-q5_0
 ```
 
+For the LLM, install and start [Ollama](https://ollama.com/) and pull the model:
+
+```bash
+ollama pull qwen3:4b
+```
+
+Keep Ollama bound to loopback, and set `OLLAMA_NUM_PARALLEL=1` and `OLLAMA_MAX_LOADED_MODELS=1` in its service environment.
+
+Then point `appsettings.json` at your paths (see [Configuration](#configuration)) and run the server:
+
+```bash
+dotnet run --urls "http://0.0.0.0:8090"
+```
+
+Without `--urls`, the development default is port 5000.
+
 ## Configuration
 
-Edit `appsettings.json` (the installer does this automatically):
+Settings live in `appsettings.json`; the installer writes the Whisper and LLM values for you. Any setting can also be overridden with an environment variable that uses double underscores, for example `Address__Model=qwen3:1.7b` or `Geocoding__TimeoutSeconds=60`.
 
-```json
-{
-  "Whisper": {
-    "ModelsDir": "/path/to/whisper.cpp/models",
-    "WhisperServerBinary": "/path/to/whisper.cpp/build/bin/whisper-server",
-    "DefaultModel": "large-v3-turbo-q5_0",
-    "BasePort": 8100,
-    "InstancesPerModel": 1,
-    "MaxResidentModels": 1,
-    "Threads": 0,
-    "UseGpu": true,
-    "StartupTimeoutSeconds": 120,
-    "TimeoutSeconds": 120,
-    "DefaultPrompt": "..."
-  }
-}
-```
+### `Whisper`
 
 | Key | Default | Purpose |
 |---|---|---|
-| `ModelsDir` | — | Directory of `ggml-*.bin` models (also drives `/models`) |
-| `WhisperServerBinary` | — | Path to the built `whisper-server` binary |
-| `DefaultModel` | `large-v3-turbo-q5_0` | Model pre-warmed at startup and used when a request omits `model` |
-| `BasePort` | `8100` | First loopback port for spawned `whisper-server` processes |
-| `InstancesPerModel` | `1` | Processes per model → concurrency for a single model |
-| `MaxResidentModels` | `1` | Distinct models kept in memory (LRU eviction beyond this; a model with requests in flight is evicted only after they finish) |
-| `Threads` | `0` | Threads per process (`0` = all cores) |
-| `UseGpu` | `true` | Pass `-ng` to disable GPU when `false` |
-| `StartupTimeoutSeconds` | `120` | How long to wait for a model to load |
-| `TimeoutSeconds` | `120` | Per-inference request timeout |
-| `DefaultPrompt` | radio prompt | Decoding bias when a request omits `prompt` |
+| `ModelsDir` | — | Directory of `ggml-*.bin` models. Also drives `/models`. |
+| `WhisperServerBinary` | — | Path to the built `whisper-server` binary. |
+| `DefaultModel` | `large-v3-turbo-q5_0` | Model pre-warmed at startup and used when a request omits `model`. |
+| `BasePort` | `8100` | First loopback port for spawned `whisper-server` processes. |
+| `InstancesPerModel` | `1` | Processes per model, which sets the concurrency for a single model. |
+| `MaxResidentModels` | `1` | Distinct models kept in memory. Beyond this the least recently used model is evicted, after any in-flight requests finish. |
+| `Threads` | `0` | Threads per process (`0` = all cores). |
+| `UseGpu` | `true` | Set to `false` to disable the GPU. |
+| `StartupTimeoutSeconds` | `120` | How long to wait for a model to load. |
+| `TimeoutSeconds` | `120` | Per-inference request timeout. |
+| `DefaultPrompt` | radio prompt | Decoding bias used when a request omits `prompt`. |
 
-If a whisper-server process exits unexpectedly, the next request for that model replaces it automatically. A model load that is in progress continues even if the requesting client disconnects.
+Ports `BasePort` … `BasePort + InstancesPerModel × MaxResidentModels` are used internally and bound only to `127.0.0.1`. Only the .NET server's own port is exposed on the network.
 
-Ports `BasePort` … `BasePort + InstancesPerModel × MaxResidentModels` are used internally and only bound to `127.0.0.1`. Only the .NET server's own port is exposed on the network.
+If a `whisper-server` process exits unexpectedly, the next request for that model replaces it automatically. A model load that is in progress continues even if the requesting client disconnects.
 
-## Running
+### `Address` (LLM)
 
-If installed via the installer, the server runs as a systemd service:
+| Key | Default | Purpose |
+|---|---|---|
+| `OllamaUrl` | `http://127.0.0.1:11434/` | Ollama origin. |
+| `Model` | `qwen3:4b` | Model used for metadata, address extraction, and candidate selection. |
+| `TimeoutSeconds` | `120` | Bounds each model call once it starts. |
+| `QueueTimeoutSeconds` | `300` | Bounds the wait behind earlier calls, so a burst of transmissions does not time out while queued. |
+| `ReservedVramMb` | `3500` | Installer-only estimate of LLM VRAM, subtracted before sizing the Whisper pool. See [GPU memory](#gpu-memory-sharing-a-card-between-whisper-and-the-llm). |
 
-```bash
-systemctl status openscanner-ai    # Check status
-journalctl -u openscanner-ai -f    # View logs
-```
+Model calls run one at a time, with a 4,096-token context, a 512-token output limit, and Qwen3 thinking disabled. Output is constrained by a JSON Schema and validated again by the server. The model stays warm for five minutes after use.
 
-To run manually: `dotnet run --urls "http://0.0.0.0:8090"` (default dev port is 5000).
+### `Geocoding`
 
-## Swagger / API documentation
+| Key | Default | Purpose |
+|---|---|---|
+| `Endpoint` | US Census one-line address endpoint | Census-compatible geocoder. |
+| `Benchmark` | `Public_AR_Current` | Census dataset. |
+| `TimeoutSeconds` | `30` | Total queue and request timeout for a provider lookup. |
+| `DefaultCity` / `DefaultState` | `Salem` / `NH` | Locality added to lookups when a transmission does not state one. |
+| `PlaceEndpoint` | `https://photon.komoot.io/api/` | Photon instance for business and landmark lookups. |
+| `StreetEndpoint` | `https://photon.komoot.io/api/` | Photon instance for street and building fallbacks. |
+| `Places` | one example entry | Local directory of known businesses and radio aliases. See [Business names](#business-names). |
 
-Open `/swagger` on the running server (for example,
-`http://localhost:8090/swagger`) to explore and try all five endpoints, including
-WAV file uploads and JSON address requests. The OpenAPI document is available at
-`/swagger/v1/swagger.json`. Both are enabled in development and production, so
-Swagger is available when running the installed systemd service.
+## API
 
-## API Endpoints
+| Endpoint | Purpose |
+|---|---|
+| [`GET /health`](#get-health) | Server status, loaded models, and hardware |
+| [`GET /models`](#get-models) | Installed Whisper models |
+| [`POST /transcribe`](#post-transcribe) | Transcribe a WAV file, optionally with incident metadata |
+| [`POST /transmission`](#post-transmission) | Extract incident metadata and location from a transcript |
+| [`POST /address`](#post-address) | Extract and geocode a location from a transcript |
+| [`POST /geocode`](#post-geocode) | Standalone US street-address lookup |
+
+Interactive documentation is at `/swagger` (for example `http://localhost:8090/swagger`), and the OpenAPI document is at `/swagger/v1/swagger.json`. Both are enabled in development and production.
+
+Errors return an `{"error": ...}` body with these status codes:
+
+| Status | Meaning |
+|---|---|
+| 400 | Invalid request, or an unknown or uninstalled `model` |
+| 502 | `whisper-server` failed, or the model or provider returned malformed output |
+| 503 | A backend (Whisper, Ollama, or a geocoding provider) is unavailable or not configured |
+| 504 | Inference, queue, or geocoding timeout |
+
+The LLM endpoints work independently of Whisper readiness.
 
 ### GET /health
 
@@ -203,7 +230,7 @@ Lists the models installed in `ModelsDir`. OpenScanner queries this to populate 
 
 ### POST /transcribe
 
-Transcribe an audio file (multipart form data). OpenScanner sends a pre-filtered 16 kHz mono WAV.
+Transcribes an audio file sent as multipart form data. OpenScanner sends a pre-filtered 16 kHz mono WAV.
 
 ```bash
 curl -X POST http://localhost:8090/transcribe \
@@ -212,69 +239,31 @@ curl -X POST http://localhost:8090/transcribe \
   -F "prompt=Dispatch, Unit 1, 10-4, copy, over."
 ```
 
-Parameters:
-- `file` (required): WAV audio file
-- `model` (optional): model id from `/models`; defaults to `DefaultModel`
-- `prompt` (optional): context prompt to guide accuracy; defaults to `DefaultPrompt`
+| Field | Required | Purpose |
+|---|---|---|
+| `file` | yes | WAV audio file |
+| `model` | no | Model id from `/models`. Defaults to `DefaultModel`. |
+| `prompt` | no | Context prompt to guide accuracy. Defaults to `DefaultPrompt`. |
+| `includeMetadata` | no | `true` to also return incident metadata |
+| `service` | no | `police` or `fire` context for metadata. Does not change the audio decoding prompt. |
+| `defaultCity`, `defaultState` | no | Locality for this lookup. See [Default locality](#default-locality). |
 
-Response:
+By default the response is only the transcript. `{"text": ""}` means the audio was blank or silent.
+
 ```json
 { "text": "Unit 1, responding code 3 to Main and First." }
 ```
 
-`{"text": ""}` means the audio was blank or silent. Failures return an `{"error": ...}` body instead:
-400 for an invalid request or an unknown/uninstalled `model`, 502 when whisper-server fails or
-crashes during inference, 503 when Whisper is not configured, and 504 when inference times out.
-
-## Connecting to OpenScanner
-
-1. Start this server on your network (`dotnet run --urls "http://0.0.0.0:8090"` or via the systemd service).
-2. In the OpenScanner UI, go to **Settings → Transcription** and enable **AI Transcription**.
-3. Set the **Backend** to **Remote**.
-4. Enter the server URL (e.g. `http://192.168.1.100:8090`) and click **Test**.
-5. Pick a **Model** from the list queried live from this server.
-
-## Updating
-
-Re-run the installer to pull the latest code, rebuild, and restart:
+With `includeMetadata=true`, the response adds `metadata` and `metadataError`:
 
 ```bash
-./scripts/install_service.sh
-```
-
-## License
-
-MIT
-
-## User locality and optional metadata on audio uploads
-
-OpenScanner can pass the user's location settings as `defaultCity` and
-`defaultState`. Both are optional and apply only to the current lookup. Precedence:
-explicitly extracted city/state, then request defaults, then `Geocoding:DefaultCity`
-and `Geocoding:DefaultState`. Defaults do not become claimed spoken location fields.
-Blank defaults use server settings. Nonblank values are limited to 100 characters,
-without commas or control characters. These parameters are supported on `/address`
-and `/transmission` JSON requests and `/transcribe` multipart uploads.
-
-```bash
-curl http://localhost:8099/transcribe \
+curl http://localhost:8090/transcribe \
   -F 'file=@dispatch.wav' \
   -F 'includeMetadata=true' \
   -F 'service=fire' \
   -F 'defaultCity=Salem' \
   -F 'defaultState=NH'
 ```
-
-Without `includeMetadata=true`, `/transcribe` continues to return only `{ "text": "..." }`.
-With it enabled, the response has `text`, `metadata`, and `metadataError`.
-`metadata` contains the same object as `/transmission`, or `{}` for routine chatter
-or silence. Successful metadata extraction has `metadataError: null`. If extraction
-fails or the transcript exceeds 2,000 characters, the endpoint preserves the full
-transcript, returns HTTP 200 with `metadata: null`, and explains the failure in
-`metadataError`. Audio/transcription failures retain their existing error behavior.
-`service` is optional police/fire context; it does not change the audio decoding prompt.
-Metadata adds model and optional geocoding latency. Swagger shows all upload fields
-and both response modes.
 
 ```json
 {
@@ -294,19 +283,25 @@ and both response modes.
 }
 ```
 
-## Transmission metadata
+`metadata` is the same object that `/transmission` returns, or `{}` for routine chatter or silence. If extraction fails, or the transcript exceeds 2,000 characters, the endpoint still returns HTTP 200 with the full transcript, `metadata: null`, and the reason in `metadataError`. Audio and transcription failures return the usual error statuses. Metadata adds LLM and geocoding latency to the request.
 
-`POST /transmission` parses one transmission into incident metadata and location.
-It uses the same local Ollama model, serialized inference queue, and optional
-geocoding as `/address`. The existing `/address` contract is unchanged.
+### POST /transmission
+
+Parses one transmission into incident metadata and a location.
 
 ```bash
-curl http://localhost:8099/transmission \
+curl http://localhost:8090/transmission \
   -H 'Content-Type: application/json' \
   -d '{"text":"207, Ill stop. 207. 42, Kelly Road, Mass, 3, Victor, Yankee Yankee, 6-2. Copy.","service":"police","defaultCity":"Salem","defaultState":"NH"}'
 ```
 
-Example (coordinates omitted here):
+| Field | Required | Purpose |
+|---|---|---|
+| `text` | yes | Transcript. Nonblank, at most 2,000 characters. |
+| `service` | no | `police` or `fire`, case insensitive. The source channel. |
+| `defaultCity`, `defaultState` | no | Locality for this lookup. See [Default locality](#default-locality). |
+
+Example response (coordinates omitted):
 
 ```json
 {
@@ -330,119 +325,56 @@ Example (coordinates omitted here):
 }
 ```
 
-Routine chatter such as “copy”, “I'm out”, and “roger” returns HTTP 200 with `{}`,
-even with a supplied service. No geocoder is called for an empty result. Substantive
-calls can have metadata without a location (for example, a medical complaint).
-Missing fields are null. The input `service` is optional (`police` or `fire`,
-case insensitive); when supplied it overrides inference. Otherwise service is
-inferred only when clear, or null. The model classifies the first incident mentioned.
+Response behavior:
 
-Stable call types for filters: `traffic_stop`, `traffic_collision`, `fire`, `medical`,
-`rescue`, `alarm`, `security_alarm`, `assault`, `domestic_disturbance`, `theft`, `burglary`,
-`suspicious_activity`, `welfare_check`, `disturbance`, `hazard`, `public_assistance`,
-`other`. `other` represents substantive incident information with an unknown type.
-Supplied `service` is the source channel and is authoritative. It constrains both
-the model's category enum and the returned service; the server enforces the same
-allowlists even if a model violates its output schema. With no supplied service,
-the model may infer it, and an inferred service's output still uses its allowlist.
+- Routine chatter such as "copy", "I'm out", and "roger" returns HTTP 200 with `{}`, and no geocoder is called.
+- Missing fields are null. A substantive call can have metadata without a location, such as a medical complaint.
+- The model classifies the first incident mentioned. Classifications and summaries are model interpretations.
+- `incidentStatus` is `dispatched`, `en_route`, `on_scene`, `cleared`, or null, based on explicit statements.
+- `location` has the same shape as the [`/address`](#post-address) response. A geocoding failure keeps the metadata and returns `location.geocode: null`.
+
+Machine-readable JSON Schemas are in [schemas/transmission-request.schema.json](schemas/transmission-request.schema.json) and [schemas/transmission-response.schema.json](schemas/transmission-response.schema.json).
+
+#### Call types and channels
+
+A supplied `service` is the source channel and is authoritative: it sets the returned `service` and limits which call types can be returned. Without it, the model infers the service only when it is clear, and the inferred service's allowlist still applies.
 
 | Channel | Allowed call types |
-| --- | --- |
+|---|---|
 | Police | `traffic_stop`, `traffic_collision`, `security_alarm`, `assault`, `domestic_disturbance`, `theft`, `burglary`, `suspicious_activity`, `welfare_check`, `disturbance`, `hazard`, `public_assistance`, `other` |
 | Fire | `traffic_collision`, `fire`, `medical`, `rescue`, `alarm`, `hazard`, `public_assistance`, `other` |
 
-`security_alarm` is a police security/burglar/residential motion alarm, not a
-confirmed burglary. `alarm` is reserved for fire-service alarms. For example,
-“43 Woodmeadow Drive, residential alarm, several motion alarms” with
-`service: "police"` returns `security_alarm` and stays on the police channel.
-OpenScanner should include the new category in its police call filters.
+- `other` is substantive incident information of an unknown type, or a type that is not available on its channel. The summary and location are preserved.
+- `security_alarm` is a police security, burglar, or residential motion alarm, not a confirmed burglary. `alarm` is reserved for fire-service alarms.
+- The server enforces these allowlists even if the model violates its output schema. A model response of `alarm` on police maps to `security_alarm`, `welfare_check` on fire maps to `public_assistance`, and any other invalid combination maps to `other`.
+- These restrictions implement the application's channel taxonomy. They are not a claim about which agencies respond in reality.
 
-Fire results cannot use police welfare/security/traffic-stop categories; police
-results cannot use fire/medical/rescue/alarm categories. A call whose factual
-category is unavailable on its channel becomes `other`, preserving its summary
-and location. A legacy model response of `alarm` on police maps to `security_alarm`;
-`welfare_check` on fire maps to `public_assistance`. Other invalid channel/category
-combinations map to `other`. These restrictions implement the application's
-channel taxonomy, rather than a claim about which agencies can respond in reality.
+Classification rules worth knowing:
 
-“Fire alarm” commonly identifies dispatch in phrases like “Fire alarm to all
-companies” or “Engine 1 to Fire alarm”. Radio-address syntax is normalized to
-“Dispatch” for classification. A location plus an MDT-message update, without a
-stated incident type, is `other`. Actual activated alarms, alarm investigations,
-and resets remain `alarm`; the dispatch identifier does not override a medical
-complaint or reported structure fire.
+- **"Fire alarm" as a dispatch identifier.** Phrases like "Fire alarm to all companies" or "Engine 1 to Fire alarm" name the dispatcher, so radio-address syntax is normalized to "Dispatch" before classification. Activated alarms, alarm investigations, and resets remain `alarm`, and the identifier never overrides a medical complaint or reported structure fire.
+- **Police shorthand traffic stops.** A terse business or location followed by a registration state and plate is a traffic stop even without the word "stop", unless an explicit alarm, theft, or other incident is stated. Radio unit IDs and "in the area" do not establish a stop.
+- **Notifications.** A crash or accident notification is a substantive `other` update. Its stated address is the notification destination, not automatically a crash scene. A location plus an MDT-message update with no stated incident type is also `other`.
 
-`incidentStatus` is `dispatched`, `en_route`, `on_scene`, `cleared`, or null, based
-on explicit statements. Classification and summaries are model interpretations.
+#### Using the results in OpenScanner
 
-Machine-readable JSON Schemas are in
-[schemas/transmission-request.schema.json](schemas/transmission-request.schema.json)
-and [schemas/transmission-response.schema.json](schemas/transmission-response.schema.json).
-Swagger documents both the metadata object and empty response.
-Text must be nonblank and at most 2,000 characters. Invalid input returns 400;
-model unavailable, malformed output, and inference timeout return 503, 502, and 504.
-Geocoding failures preserve metadata with `location.geocode: null`.
+For a map, use `location.geocode.latitude` and `longitude`, then filter on `callType` and `service`. Coordinates may rely on the default locality when the transmission omits one, and `precision: "street"` pins should be labeled as approximate.
 
-For a map, use `location.geocode.latitude` and `longitude`, then filter on `callType`
-and `service`. Coordinates may use the configured default locality when the
-transmission omits it. This endpoint does not create incident IDs, persist events,
-or link successive transmissions. OpenScanner should attach feed ID and received
-UTC timestamp and group related transmissions into incidents separately; an update
-alone may not identify its original call type or location.
+This endpoint does not create incident IDs, persist events, or link successive transmissions. OpenScanner should attach the feed ID and received UTC timestamp and group related transmissions into incidents itself; an update alone may not identify its original call type or location.
 
-Verification: `dotnet build` then `python3 scripts/test_address_endpoint.py` exercises
-mocked backend contracts and failure paths. With real Ollama and a running server,
-run `python3 scripts/test_transmission_live.py http://127.0.0.1:8099` to check actual
-chatter filtering, traffic-stop parsing, fire dispatch, and location-free medical calls.
+### POST /address
 
-For a downloaded OpenScanner support package, extract `openscanner_backup.db` to
-an investigation directory and evaluate the manually labeled real-transmission sample:
-
-```bash
-python3 scripts/evaluate_transmissions.py /tmp/openscanner-transmissions.db \
-  http://127.0.0.1:8099 /tmp/transmission-evaluation.json
-```
-
-The evaluator opens SQLite read-only. The label manifest in
-`tests/transmission_support_cases.json` contains IDs and human expectations, with
-22 development examples and 8 held-out examples. It requires the matching support
-snapshot. Reports include original transcripts and should remain with the support
-investigation. These small sample scores measure this snapshot, not production accuracy.
-On the provided November 2026 support snapshot with `qwen3:4b`, the labeled sample
-produced 29/30 expected classifications (21/22 development, 8/8 held out); all 30
-responses matched the JSON Schema. One noninjury fall requesting assistance was
-classified as `welfare_check` instead of the expected `public_assistance`. Keep this
-case as a known mismatch, not an exact accuracy estimate for the full database.
-
-To isolate classification from network availability, an evaluation-only server may
-point its geocoding endpoints at an unavailable local port; location extraction is
-still checked, while geocoding gracefully returns null. Never use receiver/channel
-coordinates in the database as incident coordinates.
-
-## Address extraction and automatic location lookup
-
-`POST /address` accepts JSON text, extracts a location, and automatically resolves
-its address and coordinates when possible. Extraction uses a separately
-running [Ollama](https://ollama.com/) service. The installer now provisions local
-Ollama and the configured LLM automatically. For an externally managed setup or
-when using `--skip-ollama`, install/start Ollama separately and download the model:
-
-```bash
-ollama pull qwen3:4b
-```
-
-Configure `Address:OllamaUrl` (default `http://127.0.0.1:11434/`), `Address:Model`
-(default `qwen3:4b`) and `Address:TimeoutSeconds` (default `120`) in appsettings.json.
-Model calls run one at a time. `Address:TimeoutSeconds` bounds each call once it starts;
-`Address:QueueTimeoutSeconds` (default `300`) separately bounds the wait behind earlier calls,
-so a burst of transmissions does not time out while queued.
-Environment overrides such as `Address__Model` also work. Keep Ollama bound to loopback.
+Extracts a location from transcript text and resolves its address and coordinates when possible.
 
 ```bash
 curl http://localhost:8090/address \
   -H 'Content-Type: application/json' \
   -d '{"text":"Dispatch, respond to 123 Main Street, apartment 4, Springfield."}'
 ```
+
+| Field | Required | Purpose |
+|---|---|---|
+| `text` | yes | Transcript. Nonblank, at most 2,000 characters. |
+| `defaultCity`, `defaultState` | no | Locality for this lookup. See [Default locality](#default-locality). |
 
 Example response (actual extraction depends on the model):
 
@@ -462,170 +394,45 @@ Example response (actual extraction depends on the model):
 }
 ```
 
-The first address is extracted if several are mentioned. Intersections use `street`
-and `crossStreet`; partial addresses are supported. Missing fields are null, and
-no location produces an object with every field null, without making an external lookup.
-`placeName` contains an extracted business or landmark name. `geocode` contains the
-selected provider match (including `matchedAddress`, numeric `latitude` and
-`longitude`) or null when no match can be selected. Geocoding outages, invalid
-responses, timeouts, and ambiguous results do not discard the extracted address:
-`/address` still returns HTTP 200 with `geocode: null`.
+- If several addresses are mentioned, the first is extracted. Partial addresses are supported.
+- Intersections use `street` and `crossStreet`. `placeName` holds an extracted business or landmark name.
+- Missing fields are null. When no location is found, every field is null and no external lookup is made.
+- `geocode` holds the selected provider match, or null when none can be selected. Geocoding outages, invalid responses, timeouts, and ambiguous results never discard the extracted address: the endpoint still returns HTTP 200 with `geocode: null`.
+- The extracted fields always stay as transcribed. Corrected or completed spellings appear only inside `geocode`.
 
-Provider-backed name corrections may be combined with an omitted street suffix.
-For example, Census matches `8 Graymoor Woods` to `8 BRAEMOOR WOODS RD, SALEM, NH`.
-The validator permits at most two name edits (less for short names), with the same
-number, name-token count and directional prefix. An explicitly supplied road type
-must still agree. A corrected numbered address requires a unique provider candidate
-in the requested city/state, even if the LLM selected one of several alternatives.
-The extracted spelling and apartment remain unchanged; the canonical address appears
-only in `geocode`. No hardcoded Graymoor/Braemoor alias is used.
+The `geocode` object:
 
-Partial numbered addresses are preserved even when no street suffix was spoken.
-For example, `16 Garabedian` remains `houseNumber: "16"`, `street: "Garabedian"`
-and can resolve through Census to `16 GARABEDIAN DR, SALEM, NH, 03079`. Validation
-allows a provider to append a recognized road type only when it was absent; it
-cannot replace an explicitly supplied Street with Drive, alter the street name,
-or change the house number. Provider-completed spelling stays in `geocode`.
+| Field | Meaning |
+|---|---|
+| `matchedAddress` | The provider's canonical address |
+| `latitude`, `longitude` | Numeric coordinates from the provider, never from the LLM |
+| `provider` | The coordinate source |
+| `precision` | `building`, `address`, `place`, or `street` (see below) |
+| `attribution` | Attribution to display with OpenStreetMap-derived results ([OpenStreetMap copyright](https://www.openstreetmap.org/copyright)), or the source URL for a local-directory match |
 
-Crash/accident notifications are substantive `other` updates. Their stated address
-is the notification destination; it is not automatically described as a crash
-scene or traffic stop. Radio unit IDs and “in the area” do not establish a stop.
+| Precision | Meaning |
+|---|---|
+| `building` | An OSM building with a matching address. Not a guaranteed rooftop or entrance position. |
+| `address` | An address point, or a Census address-range interpolation |
+| `place` | A business or landmark lookup |
+| `street` | An approximate point on a named street. Never presented as a numbered address. |
 
-For street addresses, the server calls Census automatically. If Census has no
-match, a full-address Photon search can resolve a unique OSM address/building.
-It must return the exact house number, a normalized exact street name, and the
-requested US city/state. Street-only search results and neighboring house numbers
-are rejected; multiple distinct matching points remain unresolved. No business
-name or Census coverage is required for a verified numbered OSM building.
+[How location lookup works](#how-location-lookup-works) describes how a match is chosen.
 
-For example, `3 Artisan Drive, Salem, NH` resolves through Photon to the OSM
-apartment building at approximately 42.7715374, -71.2288257. The returned point
-represents the building, not apartment 204 or a confirmed entrance. The original
-extracted address and unit remain unchanged.
+### POST /geocode
 
-`geocode.precision` distinguishes `building` (OSM building with matching address),
-`address` (an address point or Census address-range interpolation), `place`
-(a business/landmark lookup), and `street` (an approximate mapped-street point). `geocode.provider` identifies the coordinate source.
-These fields are additive and are documented in Swagger and the JSON Schema.
-Building precision does not guarantee rooftop/entrance accuracy. Street-level points are never presented as numbered addresses.
-
-For a transmission naming a street without a house number, lookup can return an
-approximate street pin with `precision: "street"`, `houseNumber: null`, and Photon
-attribution. It requires the exact normalized street name and requested US town/state;
-similar names in other towns and invalid/missing points are rejected. Among available
-segments of that named street, it selects a provider point near the center of their
-combined mapped bounds. This is not a measured midpoint of the entire street or the
-reported person's position. A partial cross street such as “Lake” is preserved as
-text and is not treated as a verified intersection. The original location fields
-remain unchanged. Numbered addresses continue to require an address/building match.
-OpenScanner should label `precision: "street"` pins as approximate street locations.
-
-If no full-address building candidates exist, street-spelling repair runs next.
-When a house number and street are present, it searches Photon for similar street
-names in the requested city/state. Street type and directional
-prefixes must agree; name edits are bounded. If cross streets were extracted,
-each must have a similar local street whose bounding box is near the candidate
-street. This is proximity evidence, not proof that the roads intersect. The
-unchanged house number is then re-geocoded by Census. A unique address matching
-the number, candidate street, city and state is required. Multiple plausible
-addresses, missing cross-street evidence, or failures leave `geocode: null`.
-
-For example, `16 Shepherd Ave` with cross streets `Ivan Guile Road and Cole Street`
-can resolve to `16 SHEPARD AVE, SALEM, NH, 03079`. The extracted `address`, `street`
-and `crossStreet` stay as transcribed; the corrected provider address appears only
-in `geocode`. Photon street centroids are never returned as house coordinates.
-The fallback is used by automatic enrichment on `/address`, `/transmission`, and
-`/transcribe` with metadata, rather than the standalone `/geocode` route.
-`Geocoding:StreetEndpoint` defaults to `https://photon.komoot.io/api/`. Street
-requests are serialized/rate limited, use the geocoding timeout, and cache results
-for 24 hours by number, street, locality and cross streets. Additional requests
-can add latency. Only extracted location information is sent to providers.
-
-Location lookup rejects model-generated place names absent from the source text.
-An explicit house number and street take precedence over a business lookup, and
-selected coordinates must agree with that number and a compatible street name.
-A conflicting provider/business result leaves coordinates unresolved and preserves
-the extracted address. For example, `44 Millville Street` must never acquire the
-local Dollar Tree directory entry at `294 N Broadway`.
-
-For business names, lookup checks the configured local directory, then
-Photon/OpenStreetMap. The original text is supplied only to the local LLM for
-candidate selection. A successful business match fills address fields from the
-provider/directory, never from the LLM's memory.
-
-The configured default area is Salem, NH (`Geocoding:DefaultCity` and
-`Geocoding:DefaultState`). Missing locality is added to lookup queries; explicit
-extracted locality takes precedence. The extraction prompt distinguishes Route 28,
-radio unit IDs and registration states from house numbers and incident locality.
-On police channels, terse business/location plus registration-state and plate
-announcements are traffic stops even without the word “stop”; an explicit alarm,
-theft, or other incident takes precedence. Bare numbers before business names do
-not establish a house number or route. For example, “28 Taco Bell, California,
-677-51-John-4” identifies Taco Bell and a California plate, not a California
-incident or 28 Taco Bell. Run `python3 scripts/test_traffic_stop_shorthand_live.py`
-against a running server to verify these real-model cases.
-Automatic lookup can add the geocoding timeout and a second LLM call to latency.
-Extracted queries over 500 characters are preserved but not sent for lookup.
-
-Input must contain nonblank `text` of at most 2,000 characters (400 otherwise).
-Backend failures return 503, invalid/incomplete model output returns 502, and a
-queue/inference timeout returns 504. Requests are serialized, use a 4,096-token
-context and a 512-token output limit, and disable Qwen3 thinking. JSON schema
-constrains generation, and the server validates the returned shape. Address requests
-work independently of Whisper readiness.
-
-### Sharing an 8 GB GTX 1070 with Whisper
-
-With Whisper using approximately 4.1 GB, a 4B model at Q4 is a practical starting
-ceiling for fully GPU-resident inference. [Qwen3 4B Q4_K_M](https://ollama.com/library/qwen3:4b)
-has a 2.5 GB model file; runtime buffers and the KV cache require additional memory.
-This is an estimate, not a guaranteed fit. A 7–8B Q4 model generally exceeds the
-remaining budget once overhead is included; CPU offloading allows larger models
-at lower speed, depending on available system RAM.
-
-For this GPU, set `Whisper:InstancesPerModel` and `Whisper:MaxResidentModels` to `1`
-if you need to prevent additional Whisper copies consuming the remaining VRAM.
-These settings trade transcription concurrency/model caching for memory and are
-now the repository defaults. The installer subtracts `Address:ReservedVramMb`
-(default 3500 MB) before sizing the Whisper pool, in addition to driver headroom.
-This is only an estimate: it does not reserve GPU memory at runtime. Set it to 0
-when Ollama runs on another machine or address extraction is unused. The installer
-sets `OLLAMA_NUM_PARALLEL=1` and `OLLAMA_MAX_LOADED_MODELS=1` for managed local
-Ollama. For external setups, configure those values in the Ollama service environment
-and restart Ollama. Test simultaneous transcription and address extraction with `nvidia-smi`
-and check `ollama ps` for GPU placement. If memory is too tight, try `qwen3:1.7b`
-(download it and change `Address:Model`). Models stay warm for five minutes after use.
-
-[Ollama's hardware documentation](https://docs.ollama.com/gpu) lists the GTX 1070
-as compute capability 6.1 and currently requires NVIDIA driver 570 or newer for
-that generation. Verify GPU operation on the actual server; this project does
-not install or update drivers.
-
-### Development checks
-
-Run `dotnet build`, then `python3 scripts/test_address_endpoint.py`,
-`python3 scripts/test_street_fallback.py` and `python3 scripts/test_ollama_setup.py`.
-GitHub Actions runs the same build and offline checks on every push and pull request
-(`.github/workflows/ci.yml`). The endpoint
-checks use a local mock Ollama service and require Python 3 and loopback sockets;
-they do not download a model or require a GPU. They also verify Swagger, Census
-geocoding, caching, throttling, and LLM candidate selection using mock responses. To install this feature branch on
-the server without pulling main, use `./scripts/install_service.sh --skip-update`.
-
-
-## US address coordinates
-
-`POST /geocode` uses the free [US Census geocoder](https://geocoding.geo.census.gov/geocoder/Geocoding_Services_API.html)
-with no API key or GPU required. It sends only the supplied address to the external
-provider. `/address` now calls the same geocoding/selection service automatically.
-Use `/geocode` for a standalone street-address lookup with optional context;
-include city/state or ZIP explicitly on this standalone endpoint.
+A standalone street-address lookup against the free [US Census geocoder](https://geocoding.geo.census.gov/geocoder/Geocoding_Services_API.html). It needs no API key or GPU. Unlike the automatic lookup on the other endpoints, it applies no default locality and no fallbacks, so include the city and state or ZIP in the address.
 
 ```bash
 curl http://localhost:8090/geocode \
   -H 'Content-Type: application/json' \
   -d '{"address":"4600 Silver Hill Rd, Washington, DC 20233"}'
 ```
+
+| Field | Required | Purpose |
+|---|---|---|
+| `address` | yes | Nonblank, at most 500 characters. Sent to Census. |
+| `context` | no | At most 2,000 characters, such as the original transcript. Used by the local LLM to choose between candidates; never sent to Census. |
 
 Response shape (illustrative coordinates):
 
@@ -650,64 +457,66 @@ Response shape (illustrative coordinates):
 }
 ```
 
-No match returns HTTP 200 with `found: false`, `matches: []`, and `selectedMatch: null`.
-A single candidate is selected directly. With multiple candidates, the local LLM
-compares the address and optional `context` against the candidate addresses. All
-candidates remain in `matches`; `selectedMatchIndex` is zero-based and
-`selectedMatch` contains the selected provider result, never LLM-generated coordinates.
+All candidates remain in `matches`. `selectedMatchIndex` is zero-based, and `selectedMatch` is always a provider result.
 
-```json
-{
-  "address": "123 Main St, VA",
-  "context": "Dispatch is responding in South City."
-}
-```
+| `selectionStatus` | Meaning |
+|---|---|
+| `no_match` | HTTP 200 with `found: false`, `matches: []`, and `selectedMatch: null` |
+| `single_match` | The only candidate was selected directly |
+| `llm_selected` | The local LLM chose among several candidates using the address and `context` |
+| `ambiguous` | Insufficient evidence to choose. Selected index and match are null. |
+| `llm_unavailable` | Model failure, timeout, or invalid output. Selected index and match are null. |
 
-Selection statuses are `no_match`, `single_match`, `llm_selected`, `ambiguous`
-(insufficient evidence), or `llm_unavailable` (model failure, timeout, or invalid
-output). In the latter two cases the selected index and match are null. A selection
-is a model suggestion, not a verified location. Candidate lists over 20 entries or
-selection prompts over 6,000 characters remain ambiguous to avoid truncation.
-The original transcript can be supplied as context; context stays with the local
-Ollama service and is not sent to Census. Ranking uses the same model and inference
-queue as `/address`, with the configured address-model timeout. It does not load
-a second LLM. Cached geocoding candidates are ranked afresh for each context.
+Notes:
 
-Census estimates points along street
-address ranges; these are not guaranteed rooftop positions. Numbered street
-addresses are required by the provider; bare intersections, landmarks, and incomplete
-transcripts may not resolve. This endpoint does not supply map tiles.
+- A selection is a model suggestion, not a verified location. Candidate lists over 20 entries, or selection prompts over 6,000 characters, stay `ambiguous` to avoid truncation.
+- Ranking uses the same model and inference queue as the other LLM endpoints. A ranking failure still returns the successful geocoding response, with `llm_unavailable`.
+- Census estimates points along street address ranges; these are not guaranteed rooftop positions. It requires numbered street addresses, so bare intersections, landmarks, and incomplete transcripts may not resolve.
 
-The address must be nonblank and at most 500 characters; optional context is limited
-to 2,000 characters (400 otherwise). Geocoding provider failures
-return 503, malformed results return 502, and geocoding timeouts return 504. Ranking failures return the successful geocoding
-response with `llm_unavailable`. Calls to Census are
-serialized and spaced by at least one second per server process. Up to 1,000 query
-results (including no matches) are cached in memory for 24 hours; restart clears
-the cache. Errors are not cached or automatically retried.
+## How location lookup works
 
-`Geocoding:Endpoint`, `Geocoding:Benchmark` and `Geocoding:TimeoutSeconds` configure
-the Census-compatible backend, dataset (default `Public_AR_Current`), and total
-queue/request timeout (default 30 seconds). Environment overrides use double
-underscores, for example `Geocoding__TimeoutSeconds=60`.
+`/address`, `/transmission`, and `/transcribe` with metadata all enrich an extracted location the same way. The rules below exist so that a pin is either backed by a provider or absent: the LLM extracts names and selects among candidates, but it never supplies coordinates or address details from memory.
 
+### Default locality
 
-### Business names and local radio aliases
+When a transmission does not state a city or state, one is added to the lookup query. Precedence is:
 
-For example, submit the actual transcript to `/address`:
+1. The city and state extracted from the transmission
+2. The request's `defaultCity` and `defaultState`
+3. `Geocoding:DefaultCity` and `Geocoding:DefaultState`
 
-```json
-{"text":"117, copy, stop. Go ahead. 28, Dollar Tree, Mass, 4, Paul, Henry, Edward, 93. Copy."}
-```
+Defaults apply only to the lookup. They are never reported as spoken location fields. Blank request values fall back to the server settings; nonblank values are limited to 100 characters with no commas or control characters.
 
-A successful lookup returns `placeName: "Dollar Tree"`, the resolved street address,
-and a `geocode` object. The repository includes an entry for 294 N Broadway,
-Salem, NH 03079, verified against [Dollar Tree's store locator](https://locations.dollartree.com/nh/salem/294-n-broadway-suite-4).
-The store is Suite 4; Census resolves the street address rather than a suite entrance.
-Census returned latitude `42.7971735138`, longitude `-71.238059822759` during a
-live verification. Coordinates are fetched at runtime rather than hard-coded.
+The extraction prompt separates route numbers, radio unit IDs, and registration states from house numbers and incident locality. For example, "28 Taco Bell, California, 677-51-John-4" identifies Taco Bell and a California plate, not a California incident or an address of 28 Taco Bell.
 
-Maintain `Geocoding:Places` for known local businesses and confirmed radio aliases:
+### Numbered street addresses
+
+A numbered address is tried against these sources in order, stopping at the first verified match:
+
+1. **Census.** A provider match may differ from the transcript in two bounded ways, and the house number may never change:
+   - *Completing a missing street type.* `16 Garabedian` can resolve to `16 GARABEDIAN DR, SALEM, NH, 03079`. A type that was spoken cannot be replaced, so Street never becomes Drive.
+   - *Correcting a misheard name.* `8 Graymoor Woods` can resolve to `8 BRAEMOOR WOODS RD, SALEM, NH`. This allows at most two name edits (fewer for short names) with the same number, name-token count, and directional prefix, and it requires a unique candidate in the requested city and state.
+2. **OSM building (Photon).** If Census has no match, a full-address search can resolve a unique OSM address or building. It must return the exact house number, the exact normalized street name, and the requested US city and state. Street-only results and neighboring house numbers are rejected, and multiple distinct matching points stay unresolved. For example, `3 Artisan Drive, Salem, NH` resolves to the apartment building; the point represents the building, not a specific apartment or entrance.
+3. **Street-spelling repair.** If no building candidate exists, Photon is searched for similarly named streets in the requested city and state. Street type and directional prefix must agree and name edits are bounded. If cross streets were extracted, each must have a similar local street whose bounding box is near the candidate; this is proximity evidence, not proof of an intersection. The unchanged house number is then geocoded again by Census, and a unique match is required. For example, `16 Shepherd Ave` with cross streets `Ivan Guile Road and Cole Street` can resolve to `16 SHEPARD AVE, SALEM, NH, 03079`.
+
+Multiple plausible addresses, missing cross-street evidence, or provider failures leave `geocode: null`. A Photon street centroid is never returned as a house coordinate.
+
+### Streets without a house number
+
+A transmission that names only a street can return an approximate pin with `precision: "street"` and `houseNumber: null`. It requires the exact normalized street name in the requested US town and state; similar names in other towns are rejected. The point is chosen near the center of the combined bounds of that street's mapped segments. This is not a measured midpoint of the street, nor the position of whoever was reported. A partial cross street such as "Lake" is kept as text and is not treated as a verified intersection.
+
+### Business names
+
+A place name is used only if it appears in the source text; model-generated names are rejected. An explicit house number and street always take precedence over a business lookup, and a business result that conflicts with them leaves the coordinates unresolved. Bare numbers before a business name do not establish a house number.
+
+Lookups check the local directory first, then [Photon](https://github.com/komoot/photon):
+
+- **Local directory (`Geocoding:Places`).** Entries match a name or alias exactly, ignoring case, and require a matching city and state. Their street addresses are geocoded with Census at runtime rather than hard-coded.
+- **Photon.** Results must match the requested town, state, and US country code, and results with missing locality metadata are rejected (`NH` and `New Hampshire` are equivalent). Even a single fuzzy candidate is checked by the LLM against the business name and transcript before it is selected.
+
+A successful match fills the address fields from the directory or provider. An unknown or uncertain name stays unresolved.
+
+Photon's coverage is incomplete, which is why the directory is useful: a live query for the Salem, NH Dollar Tree returned only stores in other towns, so the repository ships a directory entry for it, verified against the [store locator](https://locations.dollartree.com/nh/salem/294-n-broadway-suite-4). Add your own known businesses and confirmed radio aliases in the same form:
 
 ```json
 {
@@ -723,63 +532,86 @@ Maintain `Geocoding:Places` for known local businesses and confirmed radio alias
 }
 ```
 
-This is a configuration example, not an actual verified business. Entries match
-names/aliases exactly ignoring case and require matching city/state. Their street
-addresses are geocoded with Census. Do not add speculative aliases for uncertain
-transcripts such as “tailwind chasers” until the intended place is confirmed.
+Do not add speculative aliases for uncertain transcripts until the intended place is confirmed.
 
-Names absent from the directory use [Photon](https://github.com/komoot/photon).
-Results must match the requested town, state and US country code; even one fuzzy
-candidate is checked by the LLM against the business name and transcript before
-selection. Missing locality metadata is rejected rather than guessing. NH and
-New Hampshire are treated as equivalent. Coverage is incomplete: the live Photon
-query for Dollar Tree returned other NH towns, which is why the verified local
-entry is useful. An unknown or uncertain name can remain unresolved.
+### Providers, limits, and privacy
 
-`Geocoding:PlaceEndpoint` defaults to `https://photon.komoot.io/api/` and can point
-to another Photon-compatible instance. The public demo permits reasonable use,
-may throttle requests, and has no availability guarantee; use a private instance
-for sustained/high-volume operation. The server caches up to 1,000 place queries
-for 24 hours and spaces uncached calls at least one second apart per process.
-Display the returned `geocode.attribution` with OpenStreetMap-derived results
-([OpenStreetMap copyright](https://www.openstreetmap.org/copyright)). Local-directory
-matches include their source URL in that field. No API key or additional GPU model
-is required. The LLM is only used to extract names/select candidates, not to invent
-coordinates or repair uncertain business names from memory.
+- **What leaves the machine.** Only the extracted location is sent to Census and Photon. The transcript is supplied only to the local Ollama model.
+- **Rate limiting.** Calls to each provider are serialized and spaced at least one second apart per server process.
+- **Caching.** Up to 1,000 query results per provider, including no-match results, are cached in memory for 24 hours. A restart clears the cache. Errors are not cached or retried automatically, and cached candidates are ranked afresh for each context.
+- **Latency.** Automatic lookup can add the geocoding timeout, a second LLM call, and extra fallback requests to a response.
+- **Query size.** Extracted queries over 500 characters are preserved in the response but not sent for lookup.
+- **Photon.** The public instance at `photon.komoot.io` permits reasonable use, may throttle, and has no availability guarantee. Point `Geocoding:PlaceEndpoint` and `Geocoding:StreetEndpoint` at a private instance for sustained or high-volume use.
+- **No map tiles.** This server returns coordinates only.
 
-Street fallback checks: `python3 scripts/test_street_fallback.py` uses local mock
-providers to exercise locality, cross-street proximity, ambiguity, number
-preservation, outages and caching. `python3 scripts/test_shepherd_live.py
-http://127.0.0.1:8099` checks the actual cardiac-arrest transmission against Ollama,
-Photon and Census; it requires those services to be available.
+## GPU memory: sharing a card between Whisper and the LLM
 
-`python3 scripts/test_dispatch_identifier_live.py http://127.0.0.1:8099` checks
-radio dispatch identifiers versus actual alarm/fire/medical calls, faintness,
-fire-service category policy, and independent numbered street extraction using
-real Ollama. Geocoding may be unavailable for these classification checks.
+These notes use an 8 GB GTX 1070 as the reference card. The numbers are estimates, not guaranteed fits.
 
-`python3 scripts/test_artisan_live.py http://127.0.0.1:8099` verifies the original
-Artisan Drive medical dispatch with real Ollama, Census and Photon. The mocked
-street fallback suite also covers exact building matches, ambiguity, duplicates,
-wrong numbers/streets/localities, street-centroid rejection and provider outages.
+- Whisper uses about 4.1 GB, which makes a 4B model at Q4 a practical ceiling for fully GPU-resident inference. [Qwen3 4B Q4_K_M](https://ollama.com/library/qwen3:4b) is a 2.5 GB file, plus runtime buffers and the KV cache.
+- A 7–8B Q4 model generally exceeds the remaining budget. CPU offloading allows larger models at lower speed, depending on system RAM.
+- Keep `Whisper:InstancesPerModel` and `Whisper:MaxResidentModels` at `1` (the defaults) so extra Whisper copies do not consume the remaining VRAM. This trades transcription concurrency and model caching for memory.
+- The installer subtracts `Address:ReservedVramMb` (default 3500 MB) and driver headroom before sizing the Whisper pool. This does not reserve memory at runtime. Set it to `0` when Ollama runs on another machine.
+- If memory is still too tight, pull `qwen3:1.7b` and set `Address:Model` to it.
 
-`python3 scripts/test_street_center_live.py http://127.0.0.1:8099` verifies the
-Bluff Street police transmission with a real approximate street pin. The mocked
-fallback suite includes street-center locality isolation, multiple segments,
-exact-name matching, missing/invalid points, and cache reuse; its center checks
-can also run with `--centers-only`.
+To check a setup, run transcription and address extraction at the same time while watching `nvidia-smi`, and use `ollama ps` to confirm GPU placement.
 
-`python3 scripts/test_channel_types_live.py http://127.0.0.1:8099` checks police
-residential alarms, fire alarms/medical calls, traffic stops, and source-channel
-precedence with real Ollama. The model's prompt and server use the same allowlists
-as the response JSON Schema and documented API.
+[Ollama's hardware documentation](https://docs.ollama.com/gpu) lists the GTX 1070 as compute capability 6.1 and currently requires NVIDIA driver 570 or newer for that generation. This project does not install or update drivers.
 
-`python3 scripts/test_partial_address_live.py http://127.0.0.1:8099` checks the
-Garabedian crash-notification sample and an accident-notification variant using
-real Ollama and Census. The mocked API checks validate omitted-suffix completion
-and rejection of a different supplied suffix or street name.
+If you install the CUDA toolkit after the initial setup, rerun the installer with `--rebuild-whisper` to recompile whisper.cpp with GPU support.
 
-`python3 scripts/test_graymoor_live.py http://127.0.0.1:8099` checks the original
-Graymoor Woods welfare-check transmission against real Ollama/Census. Mocked API
-checks also reject changed numbers, localities, directions, explicit road types,
-unrelated names, and ambiguous corrected matches.
+## Development and testing
+
+### Offline checks
+
+These need only .NET, Python 3, and loopback sockets. They run against mock Whisper, Ollama, and geocoding services, so they do not download a model, need a GPU, or touch real services, `/etc`, or packages. GitHub Actions runs the same checks on every pull request and on pushes to `main` ([.github/workflows/ci.yml](.github/workflows/ci.yml)).
+
+```bash
+dotnet build
+for f in scripts/*.sh; do bash -n "$f"; done
+python3 scripts/test_address_endpoint.py    # endpoint contracts, failure paths, Swagger, geocoding, caching
+python3 scripts/test_street_fallback.py     # building, street-repair and street-center fallbacks
+python3 scripts/test_ollama_setup.py        # installer's Ollama provisioning
+```
+
+`test_street_fallback.py --centers-only` runs just the street-center checks.
+
+### Live checks
+
+These run real transmissions against a running server with the real Ollama model, and most also need Census and Photon to be reachable. Each takes the server URL as an optional argument, defaulting to `http://127.0.0.1:8099`.
+
+| Script | Checks |
+|---|---|
+| `test_transmission_live.py` | Chatter filtering, traffic-stop parsing, fire dispatch, location-free medical calls |
+| `test_address_dispatch_live.py` | Dispatch address extraction with automatic geocoding |
+| `test_channel_types_live.py` | Police and fire call-type allowlists and source-channel precedence |
+| `test_dispatch_identifier_live.py` | "Fire alarm" as a dispatch identifier versus actual alarm, fire, and medical calls |
+| `test_traffic_stop_shorthand_live.py` | Police shorthand traffic stops (business, registration state, plate) |
+| `test_partial_address_live.py` | Addresses with no spoken street type, and crash notifications |
+| `test_graymoor_live.py` | Correction of a misheard street name |
+| `test_shepherd_live.py` | Street-spelling repair using cross streets |
+| `test_artisan_live.py` | OSM building match when Census has no address |
+| `test_street_center_live.py` | Approximate pin for a street with no house number |
+
+```bash
+python3 scripts/test_transmission_live.py http://127.0.0.1:8090
+```
+
+### Evaluating against real transmissions
+
+`scripts/evaluate_transmissions.py` scores classification against a manually labeled sample from an OpenScanner support package. Extract `openscanner_backup.db` from the package, then run:
+
+```bash
+python3 scripts/evaluate_transmissions.py /tmp/openscanner-transmissions.db \
+  http://127.0.0.1:8090 /tmp/transmission-evaluation.json
+```
+
+- The labels in `tests/transmission_support_cases.json` hold transmission IDs and human expectations (22 development and 8 held-out examples), so the matching support snapshot is required.
+- The database is opened read-only. Reports include original transcripts and should stay with the support investigation.
+- On the November 2026 snapshot with `qwen3:4b`, 29 of 30 classifications matched (21/22 development, 8/8 held out) and all 30 responses matched the JSON Schema. The known mismatch is a non-injury fall requesting assistance, classified as `welfare_check` instead of `public_assistance`. This measures one small sample, not production accuracy.
+- To isolate classification from network availability, point the geocoding endpoints of an evaluation-only server at an unused local port. Location extraction is still checked, and geocoding returns null.
+- Receiver and channel coordinates in the database are not incident coordinates and must not be used as such.
+
+## License
+
+MIT
