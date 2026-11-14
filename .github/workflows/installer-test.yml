@@ -1,0 +1,48 @@
+name: Installer Test
+
+# Builds a release tarball from the PR and runs the real install → update →
+# rollback → uninstall → source-install migration cycle against it on the runner.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/**'
+      - 'Program.cs'
+      - 'appsettings.json'
+      - 'OpenScanner.AIServer.csproj'
+      - 'version.json'
+      - '.github/workflows/installer-test.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'scripts/**'
+      - 'Program.cs'
+      - 'appsettings.json'
+      - 'OpenScanner.AIServer.csproj'
+      - 'version.json'
+      - '.github/workflows/installer-test.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: installer-test-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test-installer:
+    name: Installer
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0 # Nerdbank.GitVersioning needs full history
+
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Run installer test
+        run: ./scripts/test_installer.sh

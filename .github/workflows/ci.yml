@@ -20,10 +20,11 @@ jobs:
     timeout-minutes: 30
     steps:
       # whisper.cpp is not needed: the integration tests run against a mock
-      # whisper-server, mock Ollama and mock geocoding providers.
+      # whisper-server, mock Ollama and mock geocoding providers. The real
+      # install path is covered by installer-test.yml.
       - uses: actions/checkout@v5
         with:
-          submodules: false
+          fetch-depth: 0 # Nerdbank.GitVersioning needs full history
 
       - uses: actions/setup-dotnet@v5
         with:
@@ -51,6 +52,6 @@ jobs:
         run: python3 scripts/test_street_fallback.py
         timeout-minutes: 10
 
-      - name: Ollama setup tests
+      - name: Ollama setup and installer tests
         run: python3 scripts/test_ollama_setup.py
         timeout-minutes: 5

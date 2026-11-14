@@ -29,3 +29,7 @@ Thumbs.db
 
 # Temp audio files
 *.16k.wav
+
+# Release packaging output and a local whisper.cpp checkout (legacy source installs)
+dist/
+whisper.cpp/

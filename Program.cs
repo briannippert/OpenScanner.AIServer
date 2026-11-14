@@ -4,6 +4,20 @@ using OpenScanner.AIServer.Services;
 
 var builder = WebApplication.CreateBuilder(args);
 
+// A release install sets OPENSCANNER_AI_HOME (in the systemd unit) to the install
+// root. The release itself lives in app/ and is replaced on every update, so
+// machine-local settings are read from config/appsettings.json beside it.
+// Environment variables and the command line are re-added so they still win.
+var installHome = Environment.GetEnvironmentVariable("OPENSCANNER_AI_HOME");
+if (!string.IsNullOrWhiteSpace(installHome))
+{
+    builder.Configuration
+        .AddJsonFile(Path.Combine(Path.GetFullPath(installHome), "config", "appsettings.json"),
+            optional: true, reloadOnChange: false)
+        .AddEnvironmentVariables()
+        .AddCommandLine(args);
+}
+
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen(options =>
 {
@@ -60,6 +74,7 @@ app.MapGet("/health", (WhisperServerPool pool) =>
     return Results.Ok(new
     {
         status = ready ? "ok" : "error",
+        version = ThisAssembly.AssemblyInformationalVersion,
         defaultModel = pool.DefaultModel,
         binaryFound = pool.BinaryExists,
         defaultModelFound = pool.DefaultModelExists,
