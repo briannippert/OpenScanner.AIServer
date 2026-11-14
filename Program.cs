@@ -44,6 +44,9 @@ builder.Services.AddHttpClient("geocoding", client =>
 // One shared per-host rate limit for Census and Photon across every geocoder.
 builder.Services.AddSingleton<UpstreamThrottle>();
 builder.Services.AddSingleton<AddressGeocoder>();
+// Per-city street and business lists, downloaded once and kept on disk.
+builder.Services.AddSingleton<Gazetteer>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<Gazetteer>());
 builder.Services.AddSingleton<GeocodeResolver>();
 builder.Services.AddSingleton<PlaceGeocoder>();
 builder.Services.AddSingleton<StreetGeocoder>();
@@ -67,7 +70,7 @@ app.UseCors();
 app.UseSwagger();
 app.UseSwaggerUI(options => options.SwaggerEndpoint("v1/swagger.json", "OpenScanner API v1"));
 
-app.MapGet("/health", (WhisperServerPool pool) =>
+app.MapGet("/health", (WhisperServerPool pool, Gazetteer gazetteer) =>
 {
     var ready = pool.IsReady();
     var hw = pool.Hardware;
@@ -82,7 +85,8 @@ app.MapGet("/health", (WhisperServerPool pool) =>
         acceleration = hw.AccelerationMode,
         cpu = hw.Cpu,
         gpu = hw.Gpu,
-        gpuMemoryMb = hw.GpuMemoryMb
+        gpuMemoryMb = hw.GpuMemoryMb,
+        gazetteer = gazetteer.Status()
     });
 })
 .WithName("GetHealth").WithTags("Server")
@@ -244,7 +248,7 @@ app.MapPost("/address", async (AddressRequest request, AddressExtractor extracto
 })
 .WithName("ExtractAddress").WithTags("Address")
 .WithSummary("Extract and locate an address, business, or landmark from text")
-.WithDescription("Send nonblank text of at most 2,000 characters. Missing address fields are null; if no address is found, all fields are null. Extracts business names into placeName. Automatically geocodes street addresses through Census and businesses through a local directory or Photon, using request defaultCity/defaultState or the configured default area and uses the original text locally to resolve ambiguous candidates. The geocode field contains the selected coordinates, or null if unresolved or unavailable.")
+.WithDescription("Send nonblank text of at most 2,000 characters. Missing address fields are null; if no address is found, all fields are null. Extracts business names into placeName. Automatically geocodes street addresses through Census and businesses through a local directory, the city's downloaded OpenStreetMap street and business list, or Photon, using request defaultCity/defaultState or the configured default area and uses the original text locally to resolve ambiguous candidates. The geocode field contains the selected coordinates, or null if unresolved or unavailable.")
 .Produces<AddressResponse>()
 .Produces<ApiError>(400).Produces<ApiError>(502).Produces<ApiError>(503).Produces<ApiError>(504);
 
@@ -281,7 +285,7 @@ app.MapPost("/transmission", async (TransmissionRequest request, AddressExtracto
 })
 .WithName("ExtractTransmission").WithTags("Transmission")
 .WithSummary("Extract incident metadata and location from a radio transmission")
-.WithDescription("Returns {} for routine chatter. Substantive transmissions return callType, service, summary, incidentStatus and location (the existing address and geocode fields). Optional service input is police or fire and overrides inference. The supplied channel restricts call types: police uses security_alarm (not alarm/fire/medical/rescue); fire excludes police-only types. Out-of-channel categories become other while summary/location are preserved. Radio addresses using Fire alarm identify dispatch, not an alarm incident. defaultCity/defaultState override configured lookup defaults; spoken locality takes precedence. Unmatched street addresses first try a unique full-address Photon building match, then locality-filtered street-name repair, cross-street proximity checks, and Census revalidation. Street-only locations can return an approximate mapped-street point. geocode includes precision (building/address/place/street) and provider; extracted text is preserved. No incident tracking or grouping is performed. Call types: " + string.Join(", ", AddressExtractor.CallTypes) + ". Police: " + string.Join(", ", AddressExtractor.AllowedCallTypes("police")) + ". Fire: " + string.Join(", ", AddressExtractor.AllowedCallTypes("fire")))
+.WithDescription("Returns {} for routine chatter. Substantive transmissions return callType, service, summary, incidentStatus and location (the existing address and geocode fields). Optional service input is police or fire and overrides inference. The supplied channel restricts call types: police uses security_alarm (not alarm/fire/medical/rescue); fire excludes police-only types. Out-of-channel categories become other while summary/location are preserved. Radio addresses using Fire alarm identify dispatch, not an alarm incident. defaultCity/defaultState override configured lookup defaults; spoken locality takes precedence. Unmatched street addresses first try a unique full-address Photon building match, then locality-filtered street-name repair, cross-street proximity checks, and Census revalidation. Street-only locations can return an approximate mapped-street point, and two named streets the corner where they meet. Street and business names are matched against the city's downloaded OpenStreetMap list when available. geocode includes precision (building/address/place/street/intersection) and provider; extracted text is preserved. No incident tracking or grouping is performed. Call types: " + string.Join(", ", AddressExtractor.CallTypes) + ". Police: " + string.Join(", ", AddressExtractor.AllowedCallTypes("police")) + ". Fire: " + string.Join(", ", AddressExtractor.AllowedCallTypes("fire")))
 .Produces<TransmissionResponse>()
 .Produces<ApiError>(400).Produces<ApiError>(502).Produces<ApiError>(503).Produces<ApiError>(504);
 

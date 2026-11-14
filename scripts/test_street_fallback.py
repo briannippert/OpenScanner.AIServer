@@ -124,6 +124,7 @@ upstream = f'http://127.0.0.1:{backend.server_port}'
 env = dict(os.environ, Address__OllamaUrl=upstream, Geocoding__Endpoint=upstream+'/geocoder',
     Geocoding__PlaceEndpoint=upstream+'/buildings',
     Geocoding__StreetEndpoint=upstream+'/streets', Geocoding__TimeoutSeconds='20',
+    Geocoding__Gazetteer__Enabled='false',
     Whisper__WhisperServerBinary='/nonexistent/test-whisper', DOTNET_ENVIRONMENT='Production')
 with tempfile.TemporaryFile(mode='w+') as log:
     app = subprocess.Popen(['dotnet', 'bin/Debug/net10.0/OpenScanner.AIServer.dll', '--urls', base],

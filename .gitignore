@@ -33,3 +33,4 @@ Thumbs.db
 # Release packaging output and a local whisper.cpp checkout (legacy source installs)
 dist/
 whisper.cpp/
+data/

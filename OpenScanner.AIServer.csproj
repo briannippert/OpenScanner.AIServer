@@ -6,7 +6,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <RootNamespace>OpenScanner.AIServer</RootNamespace>
     <!-- Keep packaging output and a local whisper.cpp checkout out of the build and publish. -->
-    <DefaultItemExcludes>$(DefaultItemExcludes);whisper.cpp/**;dist/**</DefaultItemExcludes>
+    <DefaultItemExcludes>$(DefaultItemExcludes);whisper.cpp/**;dist/**;data/**</DefaultItemExcludes>
   </PropertyGroup>
 
   <ItemGroup>

@@ -35,7 +35,10 @@ public sealed class LocationEnricher(GeocodeResolver resolver, PlaceGeocoder pla
                         text, ct);
                 else if (streetOnly)
                 {
-                    geocode = await streets.ResolveCenterAsync(fields["street"]!, city, state, ct);
+                    // Two named streets: the corner itself when the gazetteer knows it.
+                    geocode = (string.IsNullOrWhiteSpace(fields["crossStreet"]) ? null :
+                        streets.ResolveIntersection(fields["street"]!, fields["crossStreet"]!, city, state))
+                        ?? await streets.ResolveCenterAsync(fields["street"]!, city, state, ct);
                     resolved = new GeocodeResponse(false, []);
                 }
                 else
@@ -122,7 +125,8 @@ public sealed class LocationEnricher(GeocodeResolver resolver, PlaceGeocoder pla
         var matchedStreet = match.Street ?? (parsed.Success ? parsed.Groups["street"].Value : null);
         if (matchedStreet is null) return false;
         if (StreetGeocoder.SameStreet(street, matchedStreet)) return true;
-        if (!uniqueCandidate || !StreetGeocoder.Similar(street, matchedStreet)) return false;
+        if (!uniqueCandidate || !(StreetGeocoder.Similar(street, matchedStreet) ||
+            StreetGeocoder.SoundsAlike(street, matchedStreet))) return false;
         // A corrected name/suffix needs a unique provider result in the requested
         // locality, not simply a close string or the model's preferred candidate.
         var matchedCity = match.City ?? (parts.Length >= 3 ? parts[1] : null);

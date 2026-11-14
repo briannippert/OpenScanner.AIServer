@@ -118,6 +118,7 @@ Everything lives under `/opt/openscanner-ai` (set `OPENSCANNER_AI_HOME` to use a
 | `app.prev/` | The previous release, kept for rollback | Replaced |
 | `config/appsettings.json` | Your settings, layered over the release's defaults | Kept |
 | `whisper/models/` | Downloaded Whisper models | Kept |
+| `data/gazetteer/` | Downloaded street and business lists, one file per city | Kept, refreshed monthly |
 | `whisper/bin/` | A `whisper-server` compiled on this machine, when one was needed | Kept, rebuilt when the release moves to a newer whisper.cpp |
 
 ### Whisper and the GPU
@@ -236,6 +237,11 @@ Model calls run one at a time, with a 4,096-token context, a 512-token output li
 | `PlaceEndpoint` | `https://photon.komoot.io/api/` | Photon instance for business and landmark lookups. |
 | `StreetEndpoint` | `https://photon.komoot.io/api/` | Photon instance for street and building fallbacks. |
 | `Places` | one example entry | Local directory of known businesses and radio aliases. See [Business names](#business-names). |
+| `Gazetteer:Enabled` | `true` | Download and use each city's street and business list. See [The city gazetteer](#the-city-gazetteer). |
+| `Gazetteer:Endpoint` | `https://overpass-api.de/api/interpreter` | Overpass API instance the lists are downloaded from. |
+| `Gazetteer:RefreshDays` | `30` | Age after which a city's list is downloaded again. |
+| `Gazetteer:CacheDir` | `data/gazetteer` under the install root | Where the lists are kept. |
+| `Gazetteer:TimeoutSeconds` | `180` | Time allowed for one city's download. |
 
 ## API
 
@@ -274,9 +280,14 @@ The LLM endpoints work independently of Whisper readiness.
   "acceleration": "GPU (CUDA)",
   "cpu": "Intel Core i7-12700K",
   "gpu": "NVIDIA GeForce RTX 3080",
-  "gpuMemoryMb": 10240
+  "gpuMemoryMb": 10240,
+  "gazetteer": [
+    { "city": "Salem", "state": "NH", "streets": 651, "places": 461, "fetchedAt": "2026-11-14T14:26:59Z" }
+  ]
 }
 ```
+
+`gazetteer` lists the cities whose street and business lists are loaded.
 
 ### GET /models
 
@@ -465,7 +476,7 @@ The `geocode` object:
 | `matchedAddress` | The provider's canonical address |
 | `latitude`, `longitude` | Numeric coordinates from the provider, never from the LLM |
 | `provider` | The coordinate source |
-| `precision` | `building`, `address`, `place`, or `street` (see below) |
+| `precision` | `building`, `address`, `place`, `street`, or `intersection` (see below) |
 | `attribution` | Attribution to display with OpenStreetMap-derived results ([OpenStreetMap copyright](https://www.openstreetmap.org/copyright)), or the source URL for a local-directory match |
 
 | Precision | Meaning |
@@ -474,6 +485,7 @@ The `geocode` object:
 | `address` | An address point, or a Census address-range interpolation |
 | `place` | A business or landmark lookup |
 | `street` | An approximate point on a named street. Never presented as a numbered address. |
+| `intersection` | The mapped point where two named streets meet |
 
 [How location lookup works](#how-location-lookup-works) describes how a match is chosen.
 
@@ -535,6 +547,20 @@ Notes:
 
 `/address`, `/transmission`, and `/transcribe` with metadata all enrich an extracted location the same way. The rules below exist so that a pin is either backed by a provider or absent: the LLM extracts names and selects among candidates, but it never supplies coordinates or address details from memory.
 
+### The city gazetteer
+
+The first time a city and state are used, the server downloads every named street and business inside that city's boundary from OpenStreetMap (one [Overpass API](https://wiki.openstreetmap.org/wiki/Overpass_API) query), saves it under `data/gazetteer/`, and keeps it in memory. The configured default city is downloaded at startup. Salem, NH is 651 streets and 461 businesses in a 250 KB file.
+
+Names from a transmission are then matched against the whole list instead of a ten-result web search:
+
+- **Streets** match on a bounded spelling difference ("Shepherd" for "Shepard"), a word run together or split ("Wood Meadow" for "Woodmeadow"), a missing road type ("Garabedian" for "Garabedian Drive"), or, when spelling finds nothing, the same pronunciation ("Pelum" for "Pelham"). Road type and direction must still agree when they were spoken.
+- **Businesses** match on their exact name, or on a close or partial name that the LLM must then confirm against the transmission.
+- **Intersections** resolve to the point where the two streets actually meet.
+
+A lookup never waits for a download. Until a city is loaded, and for any city OpenStreetMap has no boundary for, the server uses the live Photon searches described below. A list older than `Gazetteer:RefreshDays` is refreshed in the background, and the old one stays in use if that fails. At most 25 cities are held in memory; the rest stay on disk.
+
+The list only supplies names and map points. A house number is still verified by Census, and an ambiguous name still returns no pin.
+
 ### Default locality
 
 When a transmission does not state a city or state, one is added to the lookup query. Precedence is:
@@ -555,22 +581,27 @@ A numbered address is tried against these sources in order, stopping at the firs
    - *Completing a missing street type.* `16 Garabedian` can resolve to `16 GARABEDIAN DR, SALEM, NH, 03079`. A type that was spoken cannot be replaced, so Street never becomes Drive.
    - *Correcting a misheard name.* `8 Graymoor Woods` can resolve to `8 BRAEMOOR WOODS RD, SALEM, NH`. This allows at most two name edits (fewer for short names) with the same number, name-token count, and directional prefix, and it requires a unique candidate in the requested city and state.
 2. **OSM building (Photon).** If Census has no match, a full-address search can resolve a unique OSM address or building. It must return the exact house number, the exact normalized street name, and the requested US city and state. Street-only results and neighboring house numbers are rejected, and multiple distinct matching points stay unresolved. For example, `3 Artisan Drive, Salem, NH` resolves to the apartment building; the point represents the building, not a specific apartment or entrance.
-3. **Street-spelling repair.** If no building candidate exists, Photon is searched for similarly named streets in the requested city and state. Street type and directional prefix must agree and name edits are bounded. If cross streets were extracted, each must have a similar local street whose bounding box is near the candidate; this is proximity evidence, not proof of an intersection. The unchanged house number is then geocoded again by Census, and a unique match is required. For example, `16 Shepherd Ave` with cross streets `Ivan Guile Road and Cole Street` can resolve to `16 SHEPARD AVE, SALEM, NH, 03079`.
+3. **Street-spelling repair.** If no building candidate exists, the city gazetteer (or Photon, when the city is not loaded) is searched for similarly named streets in the requested city and state. Street type and directional prefix must agree and name edits are bounded. If cross streets were extracted, each must have a similar local street whose bounding box is near the candidate; this is proximity evidence, not proof of an intersection. The unchanged house number is then geocoded again by Census, and a unique match is required. For example, `16 Shepherd Ave` with cross streets `Ivan Guile Road and Cole Street` can resolve to `16 SHEPARD AVE, SALEM, NH, 03079`.
 
 Multiple plausible addresses, missing cross-street evidence, or provider failures leave `geocode: null`. A Photon street centroid is never returned as a house coordinate.
 
 ### Streets without a house number
 
-A transmission that names only a street can return an approximate pin with `precision: "street"` and `houseNumber: null`. It requires the exact normalized street name in the requested US town and state; similar names in other towns are rejected. The point is chosen near the center of the combined bounds of that street's mapped segments. This is not a measured midpoint of the street, nor the position of whoever was reported. A partial cross street such as "Lake" is kept as text and is not treated as a verified intersection.
+A transmission that names only a street can return an approximate pin with `precision: "street"` and `houseNumber: null`. It requires the exact normalized street name in the requested US town and state; similar names in other towns are rejected. The point is chosen near the center of the combined bounds of that street's mapped segments. This is not a measured midpoint of the street, nor the position of whoever was reported. With the gazetteer loaded, a street spoken without its road type is accepted when exactly one street in the city completes it.
+
+### Intersections
+
+When a transmission names two streets and no house number, the gazetteer is checked for the point where they meet, and the result has `precision: "intersection"`. Each spoken name may fit more than one street ("Broadway" for North and South Broadway); a pin is returned only when every pairing that actually meets does so at the same place, within 150 metres. Otherwise, and whenever the city is not loaded, the lookup falls back to the street pin above and the cross street is kept as text.
 
 ### Business names
 
 A place name is used only if it appears in the source text; model-generated names are rejected. An explicit house number and street always take precedence over a business lookup, and a business result that conflicts with them leaves the coordinates unresolved. Bare numbers before a business name do not establish a house number.
 
-Lookups check the local directory first, then [Photon](https://github.com/komoot/photon):
+Lookups check the local directory first, then the city gazetteer, then [Photon](https://github.com/komoot/photon):
 
 - **Local directory (`Geocoding:Places`).** Entries match a name or alias exactly, ignoring case, and require a matching city and state. Their street addresses are geocoded with Census at runtime rather than hard-coded.
-- **Photon.** Results must match the requested town, state, and US country code, and results with missing locality metadata are rejected (`NH` and `New Hampshire` are equivalent). Even a single fuzzy candidate is checked by the LLM against the business name and transcript before it is selected.
+- **City gazetteer.** A name that exactly matches a single business in the city is selected directly. Several branches of the same name, or a close but inexact name, are passed to the LLM to choose using the transcript, and stay unresolved if it cannot.
+- **Photon.** Used when the gazetteer has no match or the city is not loaded. Results must match the requested town, state, and US country code, and results with missing locality metadata are rejected (`NH` and `New Hampshire` are equivalent). Even a single fuzzy candidate is checked by the LLM against the business name and transcript before it is selected.
 
 A successful match fills the address fields from the directory or provider. An unknown or uncertain name stays unresolved.
 
@@ -594,7 +625,8 @@ Do not add speculative aliases for uncertain transcripts until the intended plac
 
 ### Providers, limits, and privacy
 
-- **What leaves the machine.** Only the extracted location is sent to Census and Photon. The transcript is supplied only to the local Ollama model.
+- **What leaves the machine.** Only the extracted location is sent to Census and Photon, and only a city and state name to Overpass. The transcript is supplied only to the local Ollama model.
+- **Overpass.** The public instance at `overpass-api.de` is a shared, free service. The server asks it for one city at a time, once a month per city, and waits 15 minutes after a failure and a day after a city is not found. Point `Geocoding:Gazetteer:Endpoint` at another instance if you cover many cities.
 - **Rate limiting.** Calls to each provider are serialized and spaced at least one second apart per server process.
 - **Caching.** Up to 1,000 query results per provider, including no-match results, are cached in memory for 24 hours. A restart clears the cache. Errors are not cached or retried automatically, and cached candidates are ranked afresh for each context.
 - **Latency.** Automatic lookup can add the geocoding timeout, a second LLM call, and extra fallback requests to a response.
@@ -629,6 +661,7 @@ dotnet build
 for f in scripts/*.sh; do bash -n "$f"; done
 python3 scripts/test_address_endpoint.py    # endpoint contracts, failure paths, Swagger, geocoding, caching
 python3 scripts/test_street_fallback.py     # building, street-repair and street-center fallbacks
+python3 scripts/test_gazetteer.py           # city street/business lists: repair, intersections, businesses, caching
 python3 scripts/test_ollama_setup.py        # installer: Ollama provisioning, install, update, rollback, migration
 ```
 
